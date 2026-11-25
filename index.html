@@ -67,6 +67,17 @@
   input[type=number] { width: 90px; }
   label { color: var(--muted); font-size: 12px; }
   .note { color: var(--muted); font-size: 12px; margin-top: 14px; }
+  h2 { font-size: 14px; margin: 16px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  #speciesList { list-style: none; margin: 0; padding: 0; }
+  #speciesList li {
+    display: grid; grid-template-columns: 14px 1fr auto; gap: 8px; align-items: center;
+    padding: 4px 6px; border-radius: 5px; font-size: 13px;
+  }
+  #speciesList li:nth-child(odd) { background: var(--panel-2); }
+  #speciesList .sw { width: 12px; height: 12px; border-radius: 50%; border: 1px solid rgba(0,0,0,.4); }
+  #speciesList .nm small { color: var(--muted); display: block; font-size: 11px; }
+  #speciesList .ct { font-variant-numeric: tabular-nums; font-weight: 600; }
+  #speciesList .pred { font-size: 11px; margin-left: 4px; }
 
   /* iPad portrait / narrow screens: panel moves under the world */
   @media (orientation: portrait), (max-width: 760px) {
@@ -88,7 +99,9 @@
       <div class="stat"><small>Season</small><b id="sSeason">–</b></div>
       <div class="stat"><small>Plant food</small><b id="sFood">0</b></div>
       <div class="stat"><small>Population</small><b id="sPop">0</b></div>
+      <div class="stat"><small>Species</small><b id="sSpecies">0</b></div>
       <div class="stat"><small>Avg energy</small><b id="sEnergy">–</b></div>
+      <div class="stat"><small>Born</small><b id="sBorn">0</b></div>
       <div class="stat" style="grid-column: span 2"><small>Deaths</small><b id="sDeaths" style="font-size:13px">–</b></div>
     </div>
 
@@ -102,14 +115,17 @@
       <button id="btnNew">New world</button>
     </div>
 
-    <p class="note">Step 3: evolution. Creatures split when full, and babies mutate (hue drifts so families look alike).
-      Bigger creatures graze a wider strip and can eat anything under 0.8× their size. Meat eaters
-      (diet above 0.6) get a dark ring, and creatures with high <i>fear</i> run from them.</p>
+    <h2>Species</h2>
+    <ol id="speciesList"></ol>
+    <p id="speciesMore" class="note"></p>
+
+    <p class="note">Step 4: species. When a newborn's genes drift far enough from its species' founder,
+      it starts a new species with a new colour and a silly name. "from" shows the parent species.</p>
   </aside>
 
 <script>
 "use strict";
-const APP_VERSION = "0.3.0";
+const APP_VERSION = "0.4.0";
 
 /* ================= Seeded random (mulberry32) ================= */
 // All randomness in the sim must come from here. Never Math.random().
@@ -181,6 +197,7 @@ const DEFAULTS = {
   mutationRate: 0.15,     // chance each gene mutates at birth
   mutationSize: 0.08,     // max nudge, as a share of the gene's range
   bigJumpRate: 0.01,      // chance a newborn gets one gene re-rolled anywhere in its range
+  speciesThreshold: 0.25, // genome distance from the species founder that starts a new species
 };
 
 /* Energy tuning (not user settings) */
@@ -241,6 +258,33 @@ const LOOK = [0.34, 0.67, 1];
 const CELL = 4; // spatial grid cell size in tiles
 const NBR = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,1],[1,-1],[-1,-1]];
 
+/* ================= Species ================= */
+// Normalised genome distance: each trait scaled to 0..1 by its range, then straight-line distance.
+function genomeDistance(a, b) {
+  let d = 0;
+  for (const n of TRAIT_NAMES) {
+    const [lo, hi] = GENES[n];
+    const x = (a[n] - b[n]) / (hi - lo);
+    d += x * x;
+  }
+  return Math.sqrt(d);
+}
+
+// Silly names, picked by hashing the seed and species id so they never touch the sim's random stream.
+const NAME_A = ["Blorp", "Zib", "Wum", "Flarn", "Gloop", "Snerk", "Quib", "Mub", "Twee", "Krog", "Plim", "Durb",
+  "Fizz", "Nub", "Yapp", "Skree", "Jib", "Grub", "Pib", "Zorp", "Bleb", "Frum", "Spud", "Wob", "Glim", "Muk",
+  "Tibb", "Squee", "Drib", "Hork", "Plop", "Vrum"];
+const NAME_B = ["", "", "", "le", "o", "ix", "a", "y", "us", "et", "ling", "wump", "ster", "kin"];
+function hash32(n) {
+  n = Math.imul(n ^ (n >>> 16), 0x45d9f3b);
+  n = Math.imul(n ^ (n >>> 16), 0x45d9f3b);
+  return (n ^ (n >>> 16)) >>> 0;
+}
+function speciesName(seed, id) {
+  const h = hash32((seed * 7919) ^ (id * 104729));
+  return NAME_A[h % NAME_A.length] + NAME_B[(h >>> 8) % NAME_B.length] + "-" + id;
+}
+
 /* ================= Simulation ================= */
 class Sim {
   constructor(settings) {
@@ -264,11 +308,54 @@ class Sim {
     this.nextId = 1;
     this.deaths = { starved: 0, oldAge: 0, eaten: 0 };
     this.bornCount = 0;
+    this.species = [null];   // species[id]; id 0 unused
+    this.liveSpecies = 0;
     this.spawnStarters();
+  }
+
+  newSpecies(parent, genes) {
+    const id = this.species.length;
+    this.species.push({
+      id, parent, name: speciesName(this.settings.seed, id),
+      founder: Object.assign({}, genes), hue: genes.hue,
+      bornTick: this.tick, extinctTick: null,
+      count: 0, peakPop: 0, peakTick: this.tick, peakGenes: Object.assign({}, genes),
+    });
+    this.liveSpecies++;
+    return id;
+  }
+
+  addToSpecies(c, sp) {
+    c.sp = sp;
+    this.species[sp].count++;
+  }
+
+  removeFromSpecies(c) {
+    const s = this.species[c.sp];
+    if (--s.count === 0) { s.extinctTick = this.tick; this.liveSpecies--; }
+  }
+
+  // Every so often, update each species' peak population and its average genes at that peak.
+  census() {
+    const sums = new Map();
+    for (const c of this.creatures) {
+      let t = sums.get(c.sp);
+      if (!t) { t = { n: 0 }; for (const n of TRAIT_NAMES) t[n] = 0; sums.set(c.sp, t); }
+      t.n++;
+      for (const n of TRAIT_NAMES) t[n] += c.g[n];
+    }
+    for (const [sp, t] of sums) {
+      const s = this.species[sp];
+      if (t.n > s.peakPop) {
+        s.peakPop = t.n; s.peakTick = this.tick;
+        for (const n of TRAIT_NAMES) s.peakGenes[n] = t[n] / t.n;
+      }
+    }
   }
 
   spawnStarters() {
     const hue = Math.floor(this.rng() * 360);
+    const sp = this.newSpecies(null, Object.assign({}, STARTER, { hue }));
     for (let n = 0; n < this.settings.startPop; n++) {
       // Drop each starter on a fertile tile (give up after a few tries).
       let x = 0, y = 0;
@@ -280,6 +367,7 @@ class Sim {
       const c = new Creature(this.nextId++, x, y, genes, 0, this.rng() * Math.PI * 2);
       c.energy = c.maxEnergy * TUNE.startEnergy;
       c.age = Math.floor(this.rng() * TUNE.maxAge * 0.5); // stagger ages so they don't all die at once
+      this.addToSpecies(c, sp);
       this.creatures.push(c);
     }
   }
@@ -381,6 +469,7 @@ class Sim {
         c.energy += meatGain;
         prey.dead = true; prey.energy = 0;
         this.deaths.eaten++;
+        this.removeFromSpecies(prey);
         ate = true;
       }
     }
@@ -430,6 +519,13 @@ class Sim {
     const half = (c.energy - TUNE.birthCost) / 2;
     c.energy = half;
     const kid = new Creature(this.nextId++, c.x, c.y, this.mutate(c.g), half, this.rng() * Math.PI * 2);
+    // Strayed too far from its species' founder? Then it founds a new species with a fresh colour.
+    let sp = c.sp;
+    if (genomeDistance(kid.g, this.species[sp].founder) > this.settings.speciesThreshold) {
+      kid.g.hue = (kid.g.hue + 60 + this.rng() * 240) % 360;
+      sp = this.newSpecies(c.sp, kid.g);
+    }
+    this.addToSpecies(kid, sp);
     this.births.push(kid);
     this.bornCount++;
   }
@@ -438,6 +534,7 @@ class Sim {
     const ti = (c.y | 0) * this.W + (c.x | 0);
     this.food[ti] = Math.min(1, this.food[ti] + TUNE.corpseFood * c.g.size);
     this.deaths[cause]++;
+    this.removeFromSpecies(c);
   }
 
   seasonFactor() {
@@ -474,6 +571,7 @@ class Sim {
     this.births.length = 0;
 
     this.tick++;
+    if (this.tick % 50 === 0) this.census();
   }
 
   totalFood() {
@@ -565,7 +663,27 @@ function updateStats() {
   let e = 0;
   for (const c of sim.creatures) e += c.energy / c.maxEnergy;
   $("sEnergy").textContent = sim.creatures.length ? Math.round(100 * e / sim.creatures.length) + "%" : "–";
+  $("sSpecies").textContent = sim.liveSpecies;
+  $("sBorn").textContent = sim.bornCount.toLocaleString();
   $("sDeaths").textContent = `${sim.deaths.starved} starved · ${sim.deaths.oldAge} old age · ${sim.deaths.eaten} eaten`;
+}
+
+const SPECIES_SHOWN = 12;
+function updateSpeciesList() {
+  const live = sim.species.filter((s) => s && s.count > 0).sort((a, b) => b.count - a.count || a.id - b.id);
+  // Average diet per live species, so predators can be flagged.
+  const diet = new Map();
+  for (const c of sim.creatures) diet.set(c.sp, (diet.get(c.sp) || 0) + c.g.diet);
+  $("speciesList").innerHTML = live.slice(0, SPECIES_SHOWN).map((s) => {
+    const parent = s.parent ? sim.species[s.parent].name : "the first creatures";
+    const isPred = diet.get(s.id) / s.count > 0.6;
+    return `<li><span class="sw" style="background:hsl(${s.hue},75%,50%)"></span>` +
+      `<span class="nm">${s.name}${isPred ? '<span class="pred" title="meat eater">🦷</span>' : ""}<small>from ${parent}</small></span>` +
+      `<span class="ct">${s.count}</span></li>`;
+  }).join("");
+  const extinct = sim.species.length - 1 - live.length;
+  const hidden = Math.max(0, live.length - SPECIES_SHOWN);
+  $("speciesMore").textContent = (hidden ? `+ ${hidden} more alive · ` : "") + `${extinct} extinct`;
 }
 
 function newWorld() {
@@ -573,13 +691,16 @@ function newWorld() {
   sim = new Sim({ seed });
   setupRender(sim);
   updateStats();
+  updateSpeciesList();
 }
 
+let frame = 0;
 function loop() {
   if (running) {
     for (let i = 0; i < TICKS_PER_FRAME; i++) sim.step();
     draw();
     updateStats();
+    if (++frame % 15 === 0) updateSpeciesList();
   }
   requestAnimationFrame(loop);
 }
@@ -588,7 +709,7 @@ $("btnPlay").onclick = () => {
   running = !running;
   $("btnPlay").textContent = running ? "⏸ Pause" : "▶ Play";
 };
-$("btnStep").onclick = () => { sim.step(); draw(); updateStats(); };
+$("btnStep").onclick = () => { sim.step(); draw(); updateStats(); updateSpeciesList(); };
 $("btnNew").onclick = newWorld;
 window.addEventListener("resize", resize);
 
