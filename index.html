@@ -102,14 +102,14 @@
       <button id="btnNew">New world</button>
     </div>
 
-    <p class="note">Step 2: creatures. 120 plant eaters wander, sense food up to <i>sense</i> tiles away,
-      eat, and burn energy. Brighter = more energy. No breeding yet, so they all die of old age
-      within 1,500 ticks. Breeding arrives in step 3.</p>
+    <p class="note">Step 3: evolution. Creatures split when full, and babies mutate (hue drifts so families look alike).
+      Bigger creatures graze a wider strip and can eat anything under 0.8× their size. Meat eaters
+      (diet above 0.6) get a dark ring, and creatures with high <i>fear</i> run from them.</p>
   </aside>
 
 <script>
 "use strict";
-const APP_VERSION = "0.2.0";
+const APP_VERSION = "0.3.0";
 
 /* ================= Seeded random (mulberry32) ================= */
 // All randomness in the sim must come from here. Never Math.random().
@@ -178,6 +178,9 @@ const DEFAULTS = {
   seasons: true,
   yearLength: 2000,       // ticks per year
   seasonAmp: 0.4,         // ±40%
+  mutationRate: 0.15,     // chance each gene mutates at birth
+  mutationSize: 0.08,     // max nudge, as a share of the gene's range
+  bigJumpRate: 0.01,      // chance a newborn gets one gene re-rolled anywhere in its range
 };
 
 /* Energy tuning (not user settings) */
@@ -185,9 +188,19 @@ const TUNE = {
   costScale: 0.05,        // multiplies the whole cost formula
   base: 0.4,              // base in: base + size×0.6 + speed²×size×0.4 + sense×0.02
   energyPerSize: 10,      // max energy = size × this
-  startEnergy: 0.5,       // newborns of the first generation start at this share of max
+  startEnergy: 0.5,       // first generation starts at this share of max
   maxAge: 1500,
   corpseFood: 0.3,        // plant food left on the tile per unit of size
+  meatValue: 0.8,         // (prey energy + body) × diet × this
+  bodyEnergy: 3,          // extra meat per unit of prey size, on top of its stored energy
+  attackRatio: 0.8,       // can only attack prey under this × own size
+  threatDiet: 0.5,        // others above this diet count as meat eaters to flee from
+  hueDrift: 4,            // hue wanders ± this every birth so families look alike
+  biteBase: 0,            // plant appetite per tick = biteBase + biteSize × size
+  biteSize: 0.6,
+  minAttackDiet: 0.25,    // pure plant eaters don't bother attacking
+  birthCost: 0,           // energy lost every time a creature splits
+  catchChance: 0.2,       // attack success = this × (hunter speed ÷ prey speed), max 0.95
 };
 
 /* ================= Genes ================= */
@@ -202,6 +215,7 @@ const GENES = {
   hue:     [0, 360],
 };
 const GENE_NAMES = Object.keys(GENES);
+const TRAIT_NAMES = GENE_NAMES.filter((n) => n !== "hue");
 const STARTER = { size: 1, speed: 1, sense: 5, diet: 0.05, fear: 0.5, breedAt: 0.7, wander: 0.3 };
 
 class Creature {
@@ -211,6 +225,7 @@ class Creature {
     this.g = genes;
     this.heading = heading;
     this.age = 0;
+    this.dead = false;
     this.maxEnergy = genes.size * TUNE.energyPerSize;
     this.energy = Math.min(energy, this.maxEnergy);
     const { size, speed, sense } = genes;
@@ -222,6 +237,9 @@ class Creature {
 const DIRS = [];
 for (let d = 0; d < 8; d++) DIRS.push([Math.cos(d * Math.PI / 4), Math.sin(d * Math.PI / 4)]);
 const LOOK = [0.34, 0.67, 1];
+
+const CELL = 4; // spatial grid cell size in tiles
+const NBR = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,1],[1,-1],[-1,-1]];
 
 /* ================= Simulation ================= */
 class Sim {
@@ -236,9 +254,16 @@ class Sim {
     // Start each tile part-way to its fertile maximum.
     for (let i = 0; i < this.food.length; i++) this.food[i] = this.fertility[i] * (0.6 + 0.4 * this.rng());
 
+    // Spatial grid: a linked list of creature indexes per cell, rebuilt every tick.
+    this.gw = Math.ceil(W / CELL); this.gh = Math.ceil(H / CELL);
+    this.cellHead = new Int32Array(this.gw * this.gh);
+    this.cellNext = new Int32Array(1024);
+
     this.creatures = [];
+    this.births = [];
     this.nextId = 1;
-    this.deaths = { starved: 0, oldAge: 0 };
+    this.deaths = { starved: 0, oldAge: 0, eaten: 0 };
+    this.bornCount = 0;
     this.spawnStarters();
   }
 
@@ -259,14 +284,27 @@ class Sim {
     }
   }
 
+  buildGrid() {
+    const cs = this.creatures, n = cs.length;
+    if (this.cellNext.length < n) this.cellNext = new Int32Array(n * 2);
+    const head = this.cellHead, next = this.cellNext, gw = this.gw;
+    head.fill(-1);
+    for (let i = 0; i < n; i++) {
+      const c = cs[i];
+      const cell = ((c.y / CELL) | 0) * gw + ((c.x / CELL) | 0);
+      next[i] = head[cell];
+      head[cell] = i;
+    }
+  }
+
   // Look around, pick a heading, move, eat, pay the energy bill.
   act(c) {
     const W = this.W, H = this.H, food = this.food, g = c.g;
-
-    // Sense plant food: sum the 8 directions, nearer samples count more.
-    let fx = 0, fy = 0;
     const plantTaste = 1 - g.diet;
-    if (plantTaste > 0) {
+
+    // --- Sense plant food: sum the 8 directions, nearer samples count more.
+    let fx = 0, fy = 0;
+    if (plantTaste > 0.02) {
       for (let d = 0; d < 8; d++) {
         const dx = DIRS[d][0], dy = DIRS[d][1];
         let s = 0;
@@ -278,29 +316,122 @@ class Sim {
         }
         fx += dx * s; fy += dy * s;
       }
-      fx *= plantTaste; fy *= plantTaste;
     }
 
-    // Steer: keep some momentum, pull toward food, add wander noise.
-    const m = Math.hypot(fx, fy);
+    // --- Sense other creatures: best prey, and threats to run from.
+    const cs = this.creatures, head = this.cellHead, next = this.cellNext;
+    const R = g.sense, R2 = R * R;
+    const huntable = TUNE.attackRatio * g.size;
+    let prey = null, preyScore = 0, preyDx = 0, preyDy = 0;
+    let ax = 0, ay = 0; // flee vector
+    const r = Math.ceil(R / CELL);
+    const ccx = (c.x / CELL) | 0, ccy = (c.y / CELL) | 0;
+    for (let oy = -r; oy <= r; oy++) {
+      let gy = (ccy + oy) % this.gh; if (gy < 0) gy += this.gh;
+      for (let ox = -r; ox <= r; ox++) {
+        let gx = (ccx + ox) % this.gw; if (gx < 0) gx += this.gw;
+        for (let j = head[gy * this.gw + gx]; j !== -1; j = next[j]) {
+          const o = cs[j];
+          if (o === c || o.dead) continue;
+          let dx = o.x - c.x; if (dx > W / 2) dx -= W; else if (dx < -W / 2) dx += W;
+          let dy = o.y - c.y; if (dy > H / 2) dy -= H; else if (dy < -H / 2) dy += H;
+          const d2 = dx * dx + dy * dy;
+          if (d2 > R2) continue;
+          const d = Math.sqrt(d2) + 0.5;
+          if (o.g.size < huntable) {
+            const s = (g.diet * o.energy) / d;
+            if (s > preyScore) { preyScore = s; prey = o; preyDx = dx; preyDy = dy; }
+          } else if (o.g.diet > TUNE.threatDiet && g.size < TUNE.attackRatio * o.g.size) {
+            const w = o.g.diet / (d * d);
+            ax -= dx * w; ay -= dy * w;
+          }
+        }
+      }
+    }
+
+    // --- Steer: momentum + plants + prey + fear, then wander noise.
     let vx = Math.cos(c.heading) * 0.6, vy = Math.sin(c.heading) * 0.6;
-    if (m > 0.05) { vx += fx / m; vy += fy / m; }
+    const fm = Math.hypot(fx, fy);
+    if (fm > 0.05) { vx += (fx / fm) * plantTaste; vy += (fy / fm) * plantTaste; }
+    if (prey && g.diet > 0.2) {
+      const pm = Math.hypot(preyDx, preyDy) || 1;
+      vx += (preyDx / pm) * g.diet * 2; vy += (preyDy / pm) * g.diet * 2;
+    }
+    const am = Math.hypot(ax, ay);
+    if (am > 0) { vx += (ax / am) * g.fear * 2.5; vy += (ay / am) * g.fear * 2.5; }
     c.heading = Math.atan2(vy, vx) + (this.rng() - 0.5) * Math.PI * g.wander;
 
-    // Move (the world wraps).
+    // --- Move (the world wraps).
     c.x = (c.x + Math.cos(c.heading) * g.speed) % W; if (c.x < 0) c.x += W;
     c.y = (c.y + Math.sin(c.heading) * g.speed) % H; if (c.y < 0) c.y += H;
 
-    // Eat the plant food on this tile.
+    // --- Eat: the prey if it's in reach and worth more than the plants here, else graze.
+    // Bigger creatures graze a wider strip: they also reach into the 8 neighbouring tiles.
     const ti = (c.y | 0) * W + (c.x | 0);
-    if (plantTaste > 0 && food[ti] > 0) {
-      c.energy += food[ti] * plantTaste;
-      food[ti] = 0;
-      if (c.energy > c.maxEnergy) c.energy = c.maxEnergy;
+    const appetite = TUNE.biteBase + TUNE.biteSize * g.size;
+    const plantGain = Math.min(food[ti], appetite) * plantTaste;
+    let ate = false;
+    if (prey && !prey.dead && g.diet >= TUNE.minAttackDiet) {
+      let dx = prey.x - c.x; if (dx > W / 2) dx -= W; else if (dx < -W / 2) dx += W;
+      let dy = prey.y - c.y; if (dy > H / 2) dy -= H; else if (dy < -H / 2) dy += H;
+      const reach = 0.5 + 0.35 * (g.size + prey.g.size);
+      const meatGain = (prey.energy + TUNE.bodyEnergy * prey.g.size) * g.diet * TUNE.meatValue;
+      if (dx * dx + dy * dy <= reach * reach && meatGain > plantGain &&
+          this.rng() < Math.min(0.95, TUNE.catchChance * g.speed / prey.g.speed)) {
+        c.energy += meatGain;
+        prey.dead = true; prey.energy = 0;
+        this.deaths.eaten++;
+        ate = true;
+      }
     }
+    if (!ate && plantTaste > 0.02) {
+      let left = appetite, eaten = Math.min(food[ti], left);
+      food[ti] -= eaten; left -= eaten;
+      const reachShare = (g.size - GENES.size[0]) / (GENES.size[1] - GENES.size[0]);
+      if (left > 0 && reachShare > 0) {
+        const tx = c.x | 0, ty = c.y | 0;
+        for (let d = 0; d < 8 && left > 0; d++) {
+          let nx = tx + NBR[d][0]; if (nx < 0) nx += W; else if (nx >= W) nx -= W;
+          let ny = ty + NBR[d][1]; if (ny < 0) ny += H; else if (ny >= H) ny -= H;
+          const ni = ny * W + nx;
+          const e = Math.min(food[ni] * reachShare, left);
+          food[ni] -= e; left -= e; eaten += e;
+        }
+      }
+      c.energy += eaten * plantTaste;
+    }
+    if (c.energy > c.maxEnergy) c.energy = c.maxEnergy;
 
     c.energy -= c.cost;
     c.age++;
+
+    // --- Breed: split in two when energy is high enough.
+    if (c.energy >= g.breedAt * c.maxEnergy) this.split(c);
+  }
+
+  mutate(parent) {
+    const s = this.settings, rng = this.rng, g = {};
+    for (const n of TRAIT_NAMES) {
+      const [lo, hi] = GENES[n];
+      let v = parent[n];
+      if (rng() < s.mutationRate) v += (rng() * 2 - 1) * s.mutationSize * (hi - lo);
+      g[n] = v < lo ? lo : v > hi ? hi : v;
+    }
+    if (rng() < s.bigJumpRate) {
+      const n = TRAIT_NAMES[Math.floor(rng() * TRAIT_NAMES.length)];
+      const [lo, hi] = GENES[n];
+      g[n] = lo + rng() * (hi - lo);
+    }
+    g.hue = (parent.hue + (rng() * 2 - 1) * TUNE.hueDrift + 360) % 360;
+    return g;
+  }
+
+  split(c) {
+    const half = (c.energy - TUNE.birthCost) / 2;
+    c.energy = half;
+    const kid = new Creature(this.nextId++, c.x, c.y, this.mutate(c.g), half, this.rng() * Math.PI * 2);
+    this.births.push(kid);
+    this.bornCount++;
   }
 
   die(c, cause) {
@@ -326,17 +457,21 @@ class Sim {
 
     // Creatures act in a fixed order (by array position) so runs are reproducible.
     const cs = this.creatures;
-    for (let i = 0; i < cs.length; i++) this.act(cs[i]);
+    this.buildGrid();
+    for (let i = 0; i < cs.length; i++) if (!cs[i].dead) this.act(cs[i]);
 
-    // Remove the dead, keeping order.
+    // Remove the dead (keeping order), then add newborns at the end.
     let w = 0;
     for (let i = 0; i < cs.length; i++) {
       const c = cs[i];
+      if (c.dead) continue; // eaten, already counted
       if (c.energy <= 0) this.die(c, "starved");
       else if (c.age >= TUNE.maxAge) this.die(c, "oldAge");
       else cs[w++] = c;
     }
     cs.length = w;
+    for (const b of this.births) cs.push(b);
+    this.births.length = 0;
 
     this.tick++;
   }
@@ -430,7 +565,7 @@ function updateStats() {
   let e = 0;
   for (const c of sim.creatures) e += c.energy / c.maxEnergy;
   $("sEnergy").textContent = sim.creatures.length ? Math.round(100 * e / sim.creatures.length) + "%" : "–";
-  $("sDeaths").textContent = `${sim.deaths.starved} starved · ${sim.deaths.oldAge} old age`;
+  $("sDeaths").textContent = `${sim.deaths.starved} starved · ${sim.deaths.oldAge} old age · ${sim.deaths.eaten} eaten`;
 }
 
 function newWorld() {
