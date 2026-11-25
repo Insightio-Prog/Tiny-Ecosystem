@@ -74,6 +74,8 @@
   #progressFill { height: 100%; width: 0; background: var(--accent); transition: width .1s; }
   #progress small { color: var(--muted); font-size: 12px; }
   .banner { background: #23402a; border: 1px solid var(--accent); border-radius: 6px; padding: 8px 10px; margin-bottom: 10px; font-size: 13px; }
+  textarea { width: 100%; font: inherit; font-size: 13px; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; margin: 4px 0 8px; resize: vertical; }
+  #reportSize.big { color: #e0a458; }
   details { background: var(--panel-2); border-radius: 6px; padding: 8px 10px; margin-bottom: 10px; }
   summary { cursor: pointer; font-weight: 600; }
   details[open] summary { margin-bottom: 8px; }
@@ -165,6 +167,20 @@
     </div>
     <div id="doneMsg" class="banner" hidden></div>
 
+    <details id="reportBox">
+      <summary>📋 Run Report</summary>
+      <label for="notes">Your notes (what did you see?)</label>
+      <textarea id="notes" rows="3" placeholder="e.g. the blue ones all went to the top right corner"></textarea>
+      <div class="row">
+        <button id="btnCopy">Copy Run Report</button>
+        <span id="reportSize" class="note" style="margin:0">– KB</span>
+      </div>
+      <div class="row">
+        <button id="btnDownload">Download Run Report (.json)</button>
+      </div>
+      <small id="copyMsg" class="note" style="margin:0"></small>
+    </details>
+
     <div id="inspector" hidden></div>
 
     <details id="settings">
@@ -213,13 +229,13 @@
     <h2>Events</h2>
     <ol id="eventList"></ol>
 
-    <p class="note">Step 6: charts and events. Hover or touch a chart to read values. Events are spotted
-      automatically: first predator, booms, crashes, new species and extinctions (top 20 species).</p>
+    <p class="note">Step 7: Run Report. When a run finishes, add a note and press Copy, then paste it into a
+      chat with Claude and say "Here's a Tiny Ecosystem run".</p>
   </aside>
 
 <script>
 "use strict";
-const APP_VERSION = "0.6.0";
+const APP_VERSION = "0.7.0";
 
 /* ================= Seeded random (mulberry32) ================= */
 // All randomness in the sim must come from here. Never Math.random().
@@ -406,6 +422,102 @@ function runEvents(sim) {
   const rank = { firstPredator: 0, allDead: 0, extinction: 1, crash: 1, boom: 1, newSpecies: 2 };
   evs.sort((a, b) => rank[a.type] - rank[b.type] || a.tick - b.tick);
   return evs.slice(0, MAX_EVENTS).sort((a, b) => a.tick - b.tick);
+}
+
+/* ================= Run Report ================= */
+const REPORT_FORMAT = "tiny-ecosystem-report/1";
+const SPECIES_COLS = ["id", "name", "parent", "bornTick", "extinctTick", "peakPop", "peakTick",
+  "size", "speed", "sense", "diet", "fear", "breedAt", "wander"];
+const REPORT_MAX_BYTES = 20 * 1024;
+const r2 = (v) => Math.round(v * 100) / 100;
+
+// Timeline rows every `every` ticks. Births and deaths are summed over each interval.
+function reportTimeline(sim, every) {
+  const rows = [];
+  let births = 0, deaths = 0;
+  for (const row of sim.timeline) {
+    births += row[8]; deaths += row[9];
+    if (row[0] % every === 0 || row === sim.timeline[sim.timeline.length - 1]) {
+      rows.push(row.slice(0, 8).concat([births, deaths]));
+      births = 0; deaths = 0;
+    }
+  }
+  return rows;
+}
+
+// Top 20 by peak population, plus every ancestor of a surviving species (its family tree).
+function reportSpecies(sim, maxAncestorLines) {
+  const ids = new Set(topSpecies(sim).map((s) => s.id));
+  const alive = sim.species.filter((s) => s && s.count > 0).sort((a, b) => b.count - a.count || a.id - b.id);
+  for (const s of alive.slice(0, maxAncestorLines)) {
+    for (let p = s.parent; p !== null && !ids.has(p); p = sim.species[p].parent) ids.add(p);
+  }
+  return [...ids].sort((a, b) => a - b).map((id) => {
+    const s = sim.species[id], g = s.peakGenes;
+    return [s.id, s.name, s.parent, s.bornTick, s.extinctTick, s.peakPop, s.peakTick,
+      r2(g.size), r2(g.speed), r2(g.sense), r2(g.diet), r2(g.fear), r2(g.breedAt), r2(g.wander)];
+  });
+}
+
+function histogram(values, lo, hi, bins) {
+  const h = new Array(bins).fill(0);
+  for (const v of values) h[Math.min(bins - 1, Math.max(0, Math.floor(((v - lo) / (hi - lo)) * bins)))]++;
+  return h;
+}
+
+// Pretty-print, but keep arrays of plain values and flat objects on one line, so it stays short.
+function compactJSON(v, indent = "") {
+  const flat = (x) => x === null || typeof x !== "object";
+  if (flat(v)) return JSON.stringify(v);
+  const inner = indent + "  ";
+  if (Array.isArray(v)) {
+    if (v.every(flat)) return JSON.stringify(v);
+    return "[\n" + v.map((x) => inner + compactJSON(x, inner)).join(",\n") + "\n" + indent + "]";
+  }
+  const keys = Object.keys(v);
+  if (keys.every((k) => flat(v[k])) && indent.length >= 4) return JSON.stringify(v);
+  return "{\n" + keys.map((k) => inner + JSON.stringify(k) + ": " + compactJSON(v[k], inner)).join(",\n") + "\n" + indent + "}";
+}
+
+function buildReport(sim, notes) {
+  const st = sim.settings;
+  const target = Math.max(1, Math.round(sim.tick / 100));
+  let every = Math.max(SAMPLE_EVERY, Math.round(target / SAMPLE_EVERY) * SAMPLE_EVERY);
+  let ancestorLines = Infinity;
+  let text = "";
+  for (let tries = 0; tries < 12; tries++) {
+    const report = {
+      format: REPORT_FORMAT,
+      meta: {
+        seed: st.seed, ticks: sim.tick, years: r2(sim.tick / st.yearLength),
+        wallSeconds: Math.round(sim.wallMs / 1000), appVersion: APP_VERSION,
+      },
+      settings: {
+        world: [sim.W, sim.H], startPop: st.startPop, mutationRate: st.mutationRate, mutationSize: st.mutationSize,
+        seasons: st.seasons, speciesThreshold: st.speciesThreshold, preset: st.preset || "Custom",
+      },
+      timeline: { every, cols: TIMELINE_COLS, rows: reportTimeline(sim, every) },
+      species: { cols: SPECIES_COLS, rows: reportSpecies(sim, ancestorLines) },
+      events: runEvents(sim),
+      final: {
+        pop: sim.creatures.length,
+        histograms: {
+          bins: 10,
+          diet: histogram(sim.creatures.map((c) => c.g.diet), 0, 1, 10),
+          size: histogram(sim.creatures.map((c) => c.g.size), GENES.size[0], GENES.size[1], 10),
+        },
+      },
+      stewNotes: notes || "",
+    };
+    text = compactJSON(report);
+    const bytes = new TextEncoder().encode(text).length;
+    if (bytes <= REPORT_MAX_BYTES) break;
+    // Too big: halve the timeline rows first, then trim the family trees.
+    if (report.timeline.rows.length > 30) every *= 2;
+    else if (ancestorLines > 0) ancestorLines = ancestorLines === Infinity ? 10 : Math.floor(ancestorLines / 2);
+    else break;
+  }
+  return text;
 }
 
 /* ================= Simulation ================= */
@@ -1127,6 +1239,52 @@ function refreshAll() {
   updateProgress();
   drawCharts();
   updateEvents();
+  updateReportSize();
+}
+
+/* ---------- Run Report ---------- */
+function currentReport() {
+  return buildReport(sim, $("notes").value);
+}
+function updateReportSize() {
+  const kb = new TextEncoder().encode(currentReport()).length / 1024;
+  $("reportSize").textContent = kb.toFixed(1) + " KB";
+  $("reportSize").classList.toggle("big", kb > 20);
+}
+function flash(msg) {
+  $("copyMsg").textContent = msg;
+  clearTimeout(flash.t);
+  flash.t = setTimeout(() => { $("copyMsg").textContent = ""; }, 4000);
+}
+async function copyReport() {
+  const text = currentReport();
+  updateReportSize();
+  try {
+    await navigator.clipboard.writeText(text);
+    flash("✅ Copied! Paste it into a chat with Claude.");
+    return;
+  } catch (e) { /* fall back below (e.g. opened from a file on iPad) */ }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed"; ta.style.top = "0"; ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.setSelectionRange(0, text.length); // iOS needs a selection range
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+  document.body.removeChild(ta);
+  flash(ok ? "✅ Copied! Paste it into a chat with Claude." : "⚠️ Copy was blocked. Try Download instead.");
+}
+function downloadReport() {
+  const blob = new Blob([currentReport()], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `tiny-ecosystem-seed${sim.settings.seed}-t${sim.tick}.json`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  flash("⬇️ Downloaded " + a.download);
 }
 
 /* ---------- Running ---------- */
@@ -1153,7 +1311,9 @@ function finishRun() {
   const msg = $("doneMsg");
   msg.hidden = false;
   msg.textContent = `✅ Run finished at tick ${sim.tick.toLocaleString()} ` +
-    `(${(sim.wallMs / 1000).toFixed(0)} s). The Run Report arrives in step 7.`;
+    `(${(sim.wallMs / 1000).toFixed(0)} s). Add your notes, then copy the Run Report below.`;
+  $("reportBox").open = true;
+  $("reportBox").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 function newWorld() {
@@ -1228,6 +1388,10 @@ $("btnStep").onclick = () => { setRunning(false); sim.step(); refreshAll(); };
 $("inSpeed").oninput = () => { $("speedLbl").textContent = ticksPerFrame() + "×"; };
 $("chkTurbo").onchange = () => { if (!$("chkTurbo").checked) draw(); };
 $("btnRunFor").onclick = startRunFor;
+$("btnCopy").onclick = copyReport;
+$("btnDownload").onclick = downloadReport;
+$("notes").addEventListener("input", () => { clearTimeout(updateReportSize.t); updateReportSize.t = setTimeout(updateReportSize, 300); });
+$("reportBox").addEventListener("toggle", () => { if ($("reportBox").open) updateReportSize(); });
 $("btnApply").onclick = () => { setRunning(false); newWorld(); };
 for (const b of document.querySelectorAll("[data-preset]")) {
   b.onclick = () => applyPresetToForm(b.dataset.preset);
