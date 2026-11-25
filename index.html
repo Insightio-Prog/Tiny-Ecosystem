@@ -133,6 +133,7 @@
 
   <aside id="panel">
     <h1>Tiny <span>Ecosystem</span></h1>
+    <p id="worldLbl" class="note" style="margin:-8px 0 10px"></p>
 
     <div class="stats">
       <div class="stat"><small>Tick</small><b id="sTick">0</b></div>
@@ -178,7 +179,11 @@
       <div class="row">
         <button id="btnDownload">Download Run Report (.json)</button>
       </div>
+      <div class="row">
+        <button id="btnShowReport">Show report text</button>
+      </div>
       <small id="copyMsg" class="note" style="margin:0"></small>
+      <textarea id="reportText" rows="8" readonly hidden style="font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px"></textarea>
     </details>
 
     <div id="inspector" hidden></div>
@@ -207,6 +212,7 @@
         <button id="btnApply">🌍 New world</button>
         <span id="presetLbl" class="note" style="margin:0">Calm Meadow</span>
       </div>
+      <small id="pendingMsg" class="note" style="margin:0;color:#e0a458" hidden>Changed. Press New world, or Play / Run for… to start a new world with these settings.</small>
     </details>
 
     <h2>Top 5 species</h2>
@@ -235,7 +241,7 @@
 
 <script>
 "use strict";
-const APP_VERSION = "0.7.1";
+const APP_VERSION = "0.7.2";
 
 /* ================= Seeded random (mulberry32) ================= */
 // All randomness in the sim must come from here. Never Math.random().
@@ -1298,15 +1304,45 @@ async function copyReport() {
   document.body.removeChild(ta);
   flash(ok ? "✅ Copied! Paste it into a chat with Claude." : "⚠️ Copy was blocked. Try Download instead.");
 }
-function downloadReport() {
-  const blob = new Blob([currentReport()], { type: "application/json" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `tiny-ecosystem-seed${sim.settings.seed}-t${sim.tick}.json`;
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
-  flash("⬇️ Downloaded " + a.download);
+async function downloadReport() {
+  const text = currentReport();
+  const name = `tiny-ecosystem-seed${sim.settings.seed}-t${sim.tick}.json`;
+  // iPad / iPhone: use the share sheet, which has "Save to Files".
+  const ios = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  if (ios && navigator.canShare) {
+    try {
+      const file = new File([text], name, { type: "application/json" });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: name });
+        flash("✅ Shared " + name);
+        return;
+      }
+    } catch (e) {
+      if (e && e.name === "AbortError") return; // they closed the share sheet
+    }
+  }
+  try {
+    const blob = new Blob([text], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    flash("⬇️ Downloading " + name + ". Nothing happened? This page may block downloads; use Show report text.");
+  } catch (e) {
+    flash("⚠️ Download was blocked here. Use Show report text instead.");
+    showReportText();
+  }
+}
+
+// Last-resort fallback: show the JSON so it can be selected and copied by hand.
+function showReportText() {
+  const box = $("reportText");
+  box.hidden = false;
+  box.value = currentReport();
+  box.focus();
+  box.setSelectionRange(0, box.value.length);
 }
 
 /* ---------- Running ---------- */
@@ -1317,7 +1353,15 @@ function setRunning(on) {
 }
 
 let runStartTick = 0, runStartTickWall = { tick: 0, ms: 0 };
+// Changed the settings but didn't press New world? Start the new world now, so the run uses them.
+function applyPendingSettings() {
+  if (!settingsDirty) return;
+  setRunning(false);
+  newWorld();
+}
+
 function startRunFor() {
+  applyPendingSettings();
   const n = Math.max(100, Math.floor(parseFloat($("inRunFor").value) || 50000));
   runStartTick = sim.tick;
   runStartTickWall = { tick: sim.tick, ms: sim.wallMs };
@@ -1338,8 +1382,17 @@ function finishRun() {
   $("reportBox").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
+let settingsDirty = false;
+function markSettingsDirty() {
+  settingsDirty = true;
+  $("pendingMsg").hidden = false;
+}
+
 function newWorld() {
+  settingsDirty = false;
+  $("pendingMsg").hidden = true;
   sim = new Sim(readSettings());
+  $("worldLbl").textContent = `Seed ${sim.settings.seed} · ${sim.settings.preset}`;
   chartSlots = new Map();
   selected = null;
   runTarget = null;
@@ -1403,7 +1456,7 @@ canvas.addEventListener("click", (e) => {
 
 /* ---------- Wiring ---------- */
 $("btnPlay").onclick = () => {
-  if (!running) $("doneMsg").hidden = true;
+  if (!running) { applyPendingSettings(); $("doneMsg").hidden = true; }
   setRunning(!running);
 };
 $("btnStep").onclick = () => { setRunning(false); sim.step(); refreshAll(); };
@@ -1412,15 +1465,17 @@ $("chkTurbo").onchange = () => { if (!$("chkTurbo").checked) draw(); };
 $("btnRunFor").onclick = startRunFor;
 $("btnCopy").onclick = copyReport;
 $("btnDownload").onclick = downloadReport;
+$("btnShowReport").onclick = showReportText;
 $("notes").addEventListener("input", () => { clearTimeout(updateReportSize.t); updateReportSize.t = setTimeout(updateReportSize, 300); });
 $("reportBox").addEventListener("toggle", () => { if ($("reportBox").open) updateReportSize(); });
 $("btnApply").onclick = () => { setRunning(false); newWorld(); };
 for (const b of document.querySelectorAll("[data-preset]")) {
-  b.onclick = () => applyPresetToForm(b.dataset.preset);
+  b.onclick = () => { applyPresetToForm(b.dataset.preset); markSettingsDirty(); };
 }
 for (const id of ["setWorld", "setPop", "setMut", "setSeasons", "setThresh"]) {
-  $(id).addEventListener("input", () => { $("presetLbl").textContent = presetName + " (edited)"; });
+  $(id).addEventListener("input", () => { $("presetLbl").textContent = presetName + " (edited)"; markSettingsDirty(); });
 }
+$("setSeed").addEventListener("input", markSettingsDirty);
 window.addEventListener("resize", resize);
 
 $("speedLbl").textContent = ticksPerFrame() + "×";
