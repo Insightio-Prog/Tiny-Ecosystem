@@ -87,6 +87,9 @@
       <div class="stat"><small>Year</small><b id="sYear">0</b></div>
       <div class="stat"><small>Season</small><b id="sSeason">–</b></div>
       <div class="stat"><small>Plant food</small><b id="sFood">0</b></div>
+      <div class="stat"><small>Population</small><b id="sPop">0</b></div>
+      <div class="stat"><small>Avg energy</small><b id="sEnergy">–</b></div>
+      <div class="stat" style="grid-column: span 2"><small>Deaths</small><b id="sDeaths" style="font-size:13px">–</b></div>
     </div>
 
     <div class="row">
@@ -99,13 +102,14 @@
       <button id="btnNew">New world</button>
     </div>
 
-    <p class="note">Step 1: the world grid. Sand = no food, green = full food.
-      Fertile patches regrow fast, near-deserts barely at all. Regrowth rises and falls with the seasons.</p>
+    <p class="note">Step 2: creatures. 120 plant eaters wander, sense food up to <i>sense</i> tiles away,
+      eat, and burn energy. Brighter = more energy. No breeding yet, so they all die of old age
+      within 1,500 ticks. Breeding arrives in step 3.</p>
   </aside>
 
 <script>
 "use strict";
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "0.2.0";
 
 /* ================= Seeded random (mulberry32) ================= */
 // All randomness in the sim must come from here. Never Math.random().
@@ -169,11 +173,55 @@ function makeFertility(W, H, rng) {
 const DEFAULTS = {
   seed: 42,
   world: [200, 140],
+  startPop: 120,
   regrowRate: 0.004,      // food per tick at full fertility, average season
   seasons: true,
   yearLength: 2000,       // ticks per year
   seasonAmp: 0.4,         // ±40%
 };
+
+/* Energy tuning (not user settings) */
+const TUNE = {
+  costScale: 0.05,        // multiplies the whole cost formula
+  base: 0.4,              // base in: base + size×0.6 + speed²×size×0.4 + sense×0.02
+  energyPerSize: 10,      // max energy = size × this
+  startEnergy: 0.5,       // newborns of the first generation start at this share of max
+  maxAge: 1500,
+  corpseFood: 0.3,        // plant food left on the tile per unit of size
+};
+
+/* ================= Genes ================= */
+const GENES = {
+  size:    [0.5, 3],
+  speed:   [0.2, 2],
+  sense:   [2, 12],
+  diet:    [0, 1],
+  fear:    [0, 1],
+  breedAt: [0.4, 0.95],
+  wander:  [0, 1],
+  hue:     [0, 360],
+};
+const GENE_NAMES = Object.keys(GENES);
+const STARTER = { size: 1, speed: 1, sense: 5, diet: 0.05, fear: 0.5, breedAt: 0.7, wander: 0.3 };
+
+class Creature {
+  constructor(id, x, y, genes, energy, heading) {
+    this.id = id;
+    this.x = x; this.y = y;
+    this.g = genes;
+    this.heading = heading;
+    this.age = 0;
+    this.maxEnergy = genes.size * TUNE.energyPerSize;
+    this.energy = Math.min(energy, this.maxEnergy);
+    const { size, speed, sense } = genes;
+    this.cost = TUNE.costScale * (TUNE.base + size * 0.6 + speed * speed * size * 0.4 + sense * 0.02);
+  }
+}
+
+// 8 fixed look directions; each is sampled at 3 distances.
+const DIRS = [];
+for (let d = 0; d < 8; d++) DIRS.push([Math.cos(d * Math.PI / 4), Math.sin(d * Math.PI / 4)]);
+const LOOK = [0.34, 0.67, 1];
 
 /* ================= Simulation ================= */
 class Sim {
@@ -187,6 +235,78 @@ class Sim {
     this.food = new Float32Array(W * H);
     // Start each tile part-way to its fertile maximum.
     for (let i = 0; i < this.food.length; i++) this.food[i] = this.fertility[i] * (0.6 + 0.4 * this.rng());
+
+    this.creatures = [];
+    this.nextId = 1;
+    this.deaths = { starved: 0, oldAge: 0 };
+    this.spawnStarters();
+  }
+
+  spawnStarters() {
+    const hue = Math.floor(this.rng() * 360);
+    for (let n = 0; n < this.settings.startPop; n++) {
+      // Drop each starter on a fertile tile (give up after a few tries).
+      let x = 0, y = 0;
+      for (let t = 0; t < 50; t++) {
+        x = this.rng() * this.W; y = this.rng() * this.H;
+        if (this.fertility[(y | 0) * this.W + (x | 0)] > 0.5) break;
+      }
+      const genes = Object.assign({}, STARTER, { hue });
+      const c = new Creature(this.nextId++, x, y, genes, 0, this.rng() * Math.PI * 2);
+      c.energy = c.maxEnergy * TUNE.startEnergy;
+      c.age = Math.floor(this.rng() * TUNE.maxAge * 0.5); // stagger ages so they don't all die at once
+      this.creatures.push(c);
+    }
+  }
+
+  // Look around, pick a heading, move, eat, pay the energy bill.
+  act(c) {
+    const W = this.W, H = this.H, food = this.food, g = c.g;
+
+    // Sense plant food: sum the 8 directions, nearer samples count more.
+    let fx = 0, fy = 0;
+    const plantTaste = 1 - g.diet;
+    if (plantTaste > 0) {
+      for (let d = 0; d < 8; d++) {
+        const dx = DIRS[d][0], dy = DIRS[d][1];
+        let s = 0;
+        for (let k = 0; k < 3; k++) {
+          const r = g.sense * LOOK[k];
+          let tx = Math.round(c.x + dx * r) % W; if (tx < 0) tx += W;
+          let ty = Math.round(c.y + dy * r) % H; if (ty < 0) ty += H;
+          s += food[ty * W + tx] / LOOK[k];
+        }
+        fx += dx * s; fy += dy * s;
+      }
+      fx *= plantTaste; fy *= plantTaste;
+    }
+
+    // Steer: keep some momentum, pull toward food, add wander noise.
+    const m = Math.hypot(fx, fy);
+    let vx = Math.cos(c.heading) * 0.6, vy = Math.sin(c.heading) * 0.6;
+    if (m > 0.05) { vx += fx / m; vy += fy / m; }
+    c.heading = Math.atan2(vy, vx) + (this.rng() - 0.5) * Math.PI * g.wander;
+
+    // Move (the world wraps).
+    c.x = (c.x + Math.cos(c.heading) * g.speed) % W; if (c.x < 0) c.x += W;
+    c.y = (c.y + Math.sin(c.heading) * g.speed) % H; if (c.y < 0) c.y += H;
+
+    // Eat the plant food on this tile.
+    const ti = (c.y | 0) * W + (c.x | 0);
+    if (plantTaste > 0 && food[ti] > 0) {
+      c.energy += food[ti] * plantTaste;
+      food[ti] = 0;
+      if (c.energy > c.maxEnergy) c.energy = c.maxEnergy;
+    }
+
+    c.energy -= c.cost;
+    c.age++;
+  }
+
+  die(c, cause) {
+    const ti = (c.y | 0) * this.W + (c.x | 0);
+    this.food[ti] = Math.min(1, this.food[ti] + TUNE.corpseFood * c.g.size);
+    this.deaths[cause]++;
   }
 
   seasonFactor() {
@@ -203,6 +323,21 @@ class Sim {
       const cap = fert[i], f = food[i] + g * cap;
       food[i] = f > cap ? cap : f;
     }
+
+    // Creatures act in a fixed order (by array position) so runs are reproducible.
+    const cs = this.creatures;
+    for (let i = 0; i < cs.length; i++) this.act(cs[i]);
+
+    // Remove the dead, keeping order.
+    let w = 0;
+    for (let i = 0; i < cs.length; i++) {
+      const c = cs[i];
+      if (c.energy <= 0) this.die(c, "starved");
+      else if (c.age >= TUNE.maxAge) this.die(c, "oldAge");
+      else cs[w++] = c;
+    }
+    cs.length = w;
+
     this.tick++;
   }
 
@@ -262,6 +397,21 @@ function draw() {
   tileCtx.putImageData(tileImg, 0, 0);
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(tileCanvas, 0, 0, canvas.width, canvas.height);
+
+  // Creatures: circles sized by `size`, coloured by `hue`. Meat eaters get a dark ring.
+  const s = canvas.width / sim.W;
+  ctx.lineWidth = Math.max(1, s * 0.15);
+  for (const c of sim.creatures) {
+    const r = (0.35 + 0.35 * c.g.size) * s;
+    const px = (c.x) * s, py = (c.y) * s;
+    ctx.beginPath();
+    ctx.arc(px, py, r, 0, Math.PI * 2);
+    ctx.fillStyle = `hsl(${c.g.hue}, 75%, ${35 + 30 * c.energy / c.maxEnergy}%)`;
+    ctx.fill();
+    ctx.strokeStyle = c.g.diet > 0.6 ? "#111" : "rgba(0,0,0,0.35)";
+    ctx.lineWidth = c.g.diet > 0.6 ? Math.max(1.5, s * 0.3) : Math.max(1, s * 0.12);
+    ctx.stroke();
+  }
 }
 
 /* ================= UI ================= */
@@ -276,6 +426,11 @@ function updateStats() {
   const phase = (sim.tick % sim.settings.yearLength) / sim.settings.yearLength;
   $("sSeason").textContent = !sim.settings.seasons ? "off" : ["Spring", "Summer", "Autumn", "Winter"][Math.floor(phase * 4)];
   $("sFood").textContent = (sim.totalFood() / (sim.W * sim.H)).toFixed(2);
+  $("sPop").textContent = sim.creatures.length.toLocaleString();
+  let e = 0;
+  for (const c of sim.creatures) e += c.energy / c.maxEnergy;
+  $("sEnergy").textContent = sim.creatures.length ? Math.round(100 * e / sim.creatures.length) + "%" : "–";
+  $("sDeaths").textContent = `${sim.deaths.starved} starved · ${sim.deaths.oldAge} old age`;
 }
 
 function newWorld() {
