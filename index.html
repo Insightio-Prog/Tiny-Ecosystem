@@ -235,7 +235,7 @@
 
 <script>
 "use strict";
-const APP_VERSION = "0.7.0";
+const APP_VERSION = "0.7.1";
 
 /* ================= Seeded random (mulberry32) ================= */
 // All randomness in the sim must come from here. Never Math.random().
@@ -401,6 +401,7 @@ function speciesName(seed, id) {
 const SAMPLE_EVERY = 50;
 const TIMELINE_COLS = ["tick", "pop", "species", "plantFood", "avgDiet", "avgSize", "avgSpeed", "avgSense", "births", "deaths"];
 const MAX_EVENTS = 60;
+const MAX_SWINGS = 8;   // max booms, and max crashes, in the event list
 
 // The 20 biggest species by peak population.
 function topSpecies(sim, n = 20) {
@@ -419,7 +420,13 @@ function runEvents(sim) {
     }
   }
   // Over the cap? Drop new-species events first, then the rest, keeping the earliest.
-  const rank = { firstPredator: 0, allDead: 0, extinction: 1, crash: 1, boom: 1, newSpecies: 2 };
+  // Keep at most a few of each boom/crash (the biggest), so they can't crowd out extinctions.
+  const swingSize = (e) => { const m = e.note.match(/(\d+) to (\d+)/); return m ? Math.abs(Math.log((+m[2] + 1) / (+m[1] + 1))) : 0; };
+  for (const type of ["crash", "boom"]) {
+    const keep = new Set(evs.filter((e) => e.type === type).sort((a, b) => swingSize(b) - swingSize(a) || a.tick - b.tick).slice(0, MAX_SWINGS));
+    for (let i = evs.length - 1; i >= 0; i--) if (evs[i].type === type && !keep.has(evs[i])) evs.splice(i, 1);
+  }
+  const rank = { firstPredator: 0, allDead: 0, extinction: 1, crash: 2, boom: 2, newSpecies: 3 };
   evs.sort((a, b) => rank[a.type] - rank[b.type] || a.tick - b.tick);
   return evs.slice(0, MAX_EVENTS).sort((a, b) => a.tick - b.tick);
 }
@@ -451,6 +458,10 @@ function reportSpecies(sim, maxAncestorLines) {
   const alive = sim.species.filter((s) => s && s.count > 0).sort((a, b) => b.count - a.count || a.id - b.id);
   for (const s of alive.slice(0, maxAncestorLines)) {
     for (let p = s.parent; p !== null && !ids.has(p); p = sim.species[p].parent) ids.add(p);
+  }
+  // Every listed species' parent is listed too (and so on up), so the family tree has no holes.
+  for (const id of [...ids]) {
+    for (let p = sim.species[id].parent; p !== null && !ids.has(p); p = sim.species[p].parent) ids.add(p);
   }
   return [...ids].sort((a, b) => a - b).map((id) => {
     const s = sim.species[id], g = s.peakGenes;
@@ -551,6 +562,7 @@ class Sim {
     this.recent = [];        // last 101 samples of per-species counts, for the species chart
     this.events = [];        // firstPredator, crash, boom, allDead (species events are derived later)
     this.flags = { firstPredator: false, allDead: false, lastCrash: -Infinity, lastBoom: -Infinity };
+    this.swings = { crash: [], boom: [] }; // every boom/crash detected, logged or not (for spotting yearly cycles)
     this.sampleBirths = 0; this.sampleDeaths = 0;
     this.spawnStarters();
     this.census();
@@ -622,16 +634,26 @@ class Sim {
     }
     if (hi >= 20 && pop < 0.6 * hi && this.tick - this.flags.lastCrash >= 1000) {
       this.flags.lastCrash = this.tick;
-      this.addEvent({ tick: this.tick, type: "crash", note: `population fell from ${hi} to ${pop}` });
+      this.logSwing("crash", `population fell from ${hi} to ${pop}`);
     }
     if (lo >= 10 && pop >= 2 * lo && this.tick - this.flags.lastBoom >= 1000) {
       this.flags.lastBoom = this.tick;
-      this.addEvent({ tick: this.tick, type: "boom", note: `population rose from ${lo} to ${pop}` });
+      this.logSwing("boom", `population rose from ${lo} to ${pop}`);
     }
     if (pop === 0 && !this.flags.allDead) {
       this.flags.allDead = true;
       this.addEvent({ tick: this.tick, type: "allDead", note: "every creature has died" });
     }
+  }
+
+  // Booms and crashes that just repeat the yearly season cycle aren't news: if one of the same kind
+  // happened about a year earlier (±20%), it is skipped. The first one of a cycle is still logged.
+  logSwing(type, note) {
+    const past = this.swings[type], year = this.settings.yearLength;
+    const seasonal = this.settings.seasons && past.some((t) => Math.abs(this.tick - t - year) <= 0.2 * year);
+    past.push(this.tick);
+    if (past.length > 20) past.shift();
+    if (!seasonal) this.addEvent({ tick: this.tick, type, note });
   }
 
   addEvent(e) {
