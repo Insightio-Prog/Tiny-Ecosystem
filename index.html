@@ -106,6 +106,17 @@
   #speciesList .nm small { color: var(--muted); display: block; font-size: 11px; }
   #speciesList .ct { font-variant-numeric: tabular-nums; font-weight: 600; }
   #speciesList .pred { font-size: 11px; margin-left: 4px; }
+  .chart { position: relative; }
+  .chart canvas { display: block; width: 100%; touch-action: pan-y; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; margin-top: 4px; color: var(--text); }
+  .legend span { display: inline-flex; align-items: center; gap: 4px; }
+  .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .legend b { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .tip { position: absolute; top: 0; right: 6px; color: var(--muted); font-size: 11px; }
+  #eventList { list-style: none; margin: 0; padding: 0; }
+  #eventList li { display: grid; grid-template-columns: 20px 1fr auto; gap: 6px; padding: 3px 4px; font-size: 12px; align-items: baseline; }
+  #eventList li small { color: var(--muted); font-variant-numeric: tabular-nums; }
+  #eventList li.empty { display: block; color: var(--muted); }
 
   /* iPad portrait / narrow screens: panel moves under the world */
   @media (orientation: portrait), (max-width: 760px) {
@@ -182,17 +193,33 @@
       </div>
     </details>
 
+    <h2>Top 5 species</h2>
+    <div class="chart">
+      <canvas id="chartSpecies" style="height:110px"></canvas>
+      <div class="legend" id="legendSpecies"></div>
+      <small class="tip" id="tipSpecies"></small>
+    </div>
+    <h2>Average diet &amp; size</h2>
+    <div class="chart">
+      <canvas id="chartTraits" style="height:140px"></canvas>
+      <div class="legend" id="legendTraits"></div>
+      <small class="tip" id="tipTraits"></small>
+    </div>
+
     <h2>Species</h2>
     <ol id="speciesList"></ol>
     <p id="speciesMore" class="note"></p>
 
-    <p class="note">Step 5: controls. Tap or click a creature to inspect it. Turbo skips drawing to simulate
-      as fast as possible. Presets live in the Settings drawer.</p>
+    <h2>Events</h2>
+    <ol id="eventList"></ol>
+
+    <p class="note">Step 6: charts and events. Hover or touch a chart to read values. Events are spotted
+      automatically: first predator, booms, crashes, new species and extinctions (top 20 species).</p>
   </aside>
 
 <script>
 "use strict";
-const APP_VERSION = "0.5.0";
+const APP_VERSION = "0.6.0";
 
 /* ================= Seeded random (mulberry32) ================= */
 // All randomness in the sim must come from here. Never Math.random().
@@ -354,6 +381,33 @@ function speciesName(seed, id) {
   return NAME_A[h % NAME_A.length] + NAME_B[(h >>> 8) % NAME_B.length] + "-" + id;
 }
 
+/* ================= History & events ================= */
+const SAMPLE_EVERY = 50;
+const TIMELINE_COLS = ["tick", "pop", "species", "plantFood", "avgDiet", "avgSize", "avgSpeed", "avgSense", "births", "deaths"];
+const MAX_EVENTS = 60;
+
+// The 20 biggest species by peak population.
+function topSpecies(sim, n = 20) {
+  return sim.species.filter(Boolean).sort((a, b) => b.peakPop - a.peakPop || a.id - b.id).slice(0, n);
+}
+
+// All events for the run: the ones the sim logged, plus new species and extinctions among the top 20.
+function runEvents(sim) {
+  const evs = sim.events.slice();
+  for (const s of topSpecies(sim)) {
+    if (s.parent !== null) {
+      evs.push({ tick: s.bornTick, type: "newSpecies", species: s.id, note: `${s.name} split from ${sim.species[s.parent].name}` });
+    }
+    if (s.extinctTick !== null) {
+      evs.push({ tick: s.extinctTick, type: "extinction", species: s.id, note: `${s.name} died out (peak ${s.peakPop})` });
+    }
+  }
+  // Over the cap? Drop new-species events first, then the rest, keeping the earliest.
+  const rank = { firstPredator: 0, allDead: 0, extinction: 1, crash: 1, boom: 1, newSpecies: 2 };
+  evs.sort((a, b) => rank[a.type] - rank[b.type] || a.tick - b.tick);
+  return evs.slice(0, MAX_EVENTS).sort((a, b) => a.tick - b.tick);
+}
+
 /* ================= Simulation ================= */
 class Sim {
   constructor(settings) {
@@ -380,7 +434,14 @@ class Sim {
     this.bornCount = 0;
     this.species = [null];   // species[id]; id 0 unused
     this.liveSpecies = 0;
+    // History, sampled every SAMPLE_EVERY ticks (feeds the charts and the Run Report).
+    this.timeline = [];      // rows: see TIMELINE_COLS
+    this.recent = [];        // last 101 samples of per-species counts, for the species chart
+    this.events = [];        // firstPredator, crash, boom, allDead (species events are derived later)
+    this.flags = { firstPredator: false, allDead: false, lastCrash: -Infinity, lastBoom: -Infinity };
+    this.sampleBirths = 0; this.sampleDeaths = 0;
     this.spawnStarters();
+    this.census();
   }
 
   newSpecies(parent, genes) {
@@ -406,22 +467,65 @@ class Sim {
   }
 
   // Every so often, update each species' peak population and its average genes at that peak.
+  // Every SAMPLE_EVERY ticks: update species peaks, record a timeline row, and look for events.
   census() {
     const sums = new Map();
+    let diet = 0, size = 0, speed = 0, sense = 0;
     for (const c of this.creatures) {
       let t = sums.get(c.sp);
       if (!t) { t = { n: 0 }; for (const n of TRAIT_NAMES) t[n] = 0; sums.set(c.sp, t); }
       t.n++;
       for (const n of TRAIT_NAMES) t[n] += c.g[n];
+      diet += c.g.diet; size += c.g.size; speed += c.g.speed; sense += c.g.sense;
     }
+    const counts = new Map();
     for (const [sp, t] of sums) {
       const s = this.species[sp];
+      counts.set(sp, t.n);
       if (t.n > s.peakPop) {
         s.peakPop = t.n; s.peakTick = this.tick;
         for (const n of TRAIT_NAMES) s.peakGenes[n] = t[n] / t.n;
       }
+      // First predator: a species averaging diet over 0.6 reaches 20 creatures.
+      if (!this.flags.firstPredator && t.n >= 20 && t.diet / t.n > 0.6) {
+        this.flags.firstPredator = true;
+        this.addEvent({ tick: this.tick, type: "firstPredator", species: sp, note: "diet crossed 0.6" });
+      }
+    }
+
+    const pop = this.creatures.length, n = pop || 1;
+    const r2 = (v) => Math.round(v * 100) / 100;
+    this.timeline.push([this.tick, pop, this.liveSpecies, r2(this.totalFood() / (this.W * this.H)),
+      r2(diet / n), r2(size / n), r2(speed / n), r2(sense / n), this.sampleBirths, this.sampleDeaths]);
+    this.sampleBirths = 0; this.sampleDeaths = 0;
+    this.recent.push({ tick: this.tick, counts });
+    if (this.recent.length > 101) this.recent.shift();
+
+    // Crash / boom: compare with the last 1,000 ticks.
+    let lo = Infinity, hi = 0;
+    for (let i = this.timeline.length - 1; i >= 0 && this.timeline[i][0] >= this.tick - 1000; i--) {
+      const p = this.timeline[i][1];
+      if (p < lo) lo = p;
+      if (p > hi) hi = p;
+    }
+    if (hi >= 20 && pop < 0.6 * hi && this.tick - this.flags.lastCrash >= 1000) {
+      this.flags.lastCrash = this.tick;
+      this.addEvent({ tick: this.tick, type: "crash", note: `population fell from ${hi} to ${pop}` });
+    }
+    if (lo >= 10 && pop >= 2 * lo && this.tick - this.flags.lastBoom >= 1000) {
+      this.flags.lastBoom = this.tick;
+      this.addEvent({ tick: this.tick, type: "boom", note: `population rose from ${lo} to ${pop}` });
+    }
+    if (pop === 0 && !this.flags.allDead) {
+      this.flags.allDead = true;
+      this.addEvent({ tick: this.tick, type: "allDead", note: "every creature has died" });
     }
   }
+
+  addEvent(e) {
+    if (this.events.length < 500) this.events.push(e);
+  }
+
 
   spawnStarters() {
     const hue = Math.floor(this.rng() * 360);
@@ -539,6 +643,7 @@ class Sim {
         c.energy += meatGain;
         prey.dead = true; prey.energy = 0;
         this.deaths.eaten++;
+        this.sampleDeaths++;
         this.removeFromSpecies(prey);
         ate = true;
       }
@@ -598,12 +703,14 @@ class Sim {
     this.addToSpecies(kid, sp);
     this.births.push(kid);
     this.bornCount++;
+    this.sampleBirths++;
   }
 
   die(c, cause) {
     const ti = (c.y | 0) * this.W + (c.x | 0);
     this.food[ti] = Math.min(1, this.food[ti] + TUNE.corpseFood * c.g.size);
     this.deaths[cause]++;
+    this.sampleDeaths++;
     this.removeFromSpecies(c);
   }
 
@@ -641,7 +748,7 @@ class Sim {
     this.births.length = 0;
 
     this.tick++;
-    if (this.tick % 50 === 0) this.census();
+    if (this.tick % SAMPLE_EVERY === 0) this.census();
   }
 
   totalFood() {
@@ -860,12 +967,166 @@ function updateProgress() {
   $("progressTxt").textContent = `${done.toLocaleString()} / ${total.toLocaleString()} ticks · ${rate.toLocaleString()} ticks/s`;
 }
 
+/* ---------- Charts (last 5,000 ticks) ---------- */
+const CHART = { grid: "#333842", axis: "#9aa0a8", text: "#c9ccd1", surface: "#1d2026", font: "11px system-ui, sans-serif" };
+// Validated categorical palette (dark-surface steps), assigned in fixed order.
+const SERIES = ["#338ced", "#e76624", "#00a888", "#d28e05", "#e24d8b"];
+const DIET_COLOR = SERIES[1], SIZE_COLOR = SERIES[0];
+// Colour follows the species, not its rank: a species keeps its slot while it stays in the top 5.
+let chartSlots = new Map();
+function assignSlots(ids) {
+  for (const id of [...chartSlots.keys()]) if (!ids.includes(id)) chartSlots.delete(id);
+  const used = new Set(chartSlots.values());
+  for (const id of ids) {
+    if (chartSlots.has(id)) continue;
+    let k = 0; while (used.has(k)) k++;
+    chartSlots.set(id, k); used.add(k);
+  }
+}
+const chartHover = { species: null, traits: null }; // hovered x position (0..1) per chart
+
+function prepCanvas(cv) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  }
+  const c = cv.getContext("2d");
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, w, h);
+  return { c, w, h };
+}
+
+// One plot strip: recessive grid, 2px lines, y labels on the left, optional crosshair.
+function drawStrip(c, box, ticks, series, yMin, yMax, yLabels, hoverIdx) {
+  const { x, y, w, h } = box;
+  const t0 = ticks[0], t1 = ticks[ticks.length - 1] || t0 + 1;
+  const X = (t) => x + ((t - t0) / Math.max(1, t1 - t0)) * w;
+  const Y = (v) => y + h - ((v - yMin) / (yMax - yMin)) * h;
+  c.font = CHART.font; c.textBaseline = "middle"; c.textAlign = "right";
+  c.lineWidth = 1;
+  for (const v of yLabels) {
+    c.strokeStyle = CHART.grid;
+    c.beginPath(); c.moveTo(x, Math.round(Y(v)) + 0.5); c.lineTo(x + w, Math.round(Y(v)) + 0.5); c.stroke();
+    c.fillStyle = CHART.axis;
+    c.fillText(String(v), x - 4, Y(v));
+  }
+  c.lineWidth = 2; c.lineJoin = "round"; c.lineCap = "round";
+  for (const s of series) {
+    c.strokeStyle = s.color;
+    c.beginPath();
+    s.values.forEach((v, i) => { const px = X(ticks[i]), py = Y(v); i ? c.lineTo(px, py) : c.moveTo(px, py); });
+    c.stroke();
+  }
+  if (hoverIdx !== null && ticks.length) {
+    const px = X(ticks[hoverIdx]);
+    c.strokeStyle = CHART.axis; c.lineWidth = 1;
+    c.beginPath(); c.moveTo(Math.round(px) + 0.5, y); c.lineTo(Math.round(px) + 0.5, y + h); c.stroke();
+    for (const s of series) {
+      // 8px marker with a 2px surface ring
+      c.beginPath(); c.arc(px, Y(s.values[hoverIdx]), 4, 0, Math.PI * 2);
+      c.fillStyle = s.color; c.fill();
+      c.strokeStyle = CHART.surface; c.lineWidth = 2; c.stroke();
+    }
+  }
+}
+
+function hoverIndex(key, n) {
+  const f = chartHover[key];
+  if (f === null || n === 0) return null;
+  return Math.max(0, Math.min(n - 1, Math.round(f * (n - 1))));
+}
+
+const PAD_L = 34, PAD_R = 6;
+
+function speciesChartData() {
+  const rec = sim.recent;
+  const last = rec.length ? rec[rec.length - 1].counts : new Map();
+  const top = [...last.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]).slice(0, 5).map(([id]) => id);
+  assignSlots(top);
+  return {
+    ticks: rec.map((r) => r.tick),
+    series: top.map((id) => ({
+      id, label: sim.species[id].name, color: SERIES[chartSlots.get(id)],
+      values: rec.map((r) => r.counts.get(id) || 0),
+    })),
+  };
+}
+
+function traitsChartData() {
+  const tl = sim.timeline, from = sim.tick - 5000;
+  let i = tl.length; while (i > 0 && tl[i - 1][0] >= from) i--;
+  const rows = tl.slice(i);
+  return { ticks: rows.map((r) => r[0]), diet: rows.map((r) => r[4]), size: rows.map((r) => r[5]) };
+}
+
+function niceMax(v) {
+  if (v <= 10) return 10;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+
+function drawCharts() {
+  // Chart 1: population of the top 5 species
+  {
+    const { c, w, h } = prepCanvas($("chartSpecies"));
+    const d = speciesChartData();
+    let mx = 0; for (const s of d.series) for (const v of s.values) if (v > mx) mx = v;
+    const top = niceMax(mx);
+    const hi = hoverIndex("species", d.ticks.length);
+    drawStrip(c, { x: PAD_L, y: 6, w: w - PAD_L - PAD_R, h: h - 12 }, d.ticks, d.series, 0, top, [0, top / 2, top], hi);
+    $("legendSpecies").innerHTML = d.series.map((s) =>
+      `<span><i style="background:${s.color}"></i>${s.label} <b>${hi !== null ? s.values[hi] : s.values[s.values.length - 1]}</b></span>`).join("");
+    $("tipSpecies").textContent = hi !== null ? `tick ${d.ticks[hi].toLocaleString()}` : "";
+  }
+  // Chart 2: average diet and average size, as two strips sharing the time axis (no dual axis)
+  {
+    const { c, w, h } = prepCanvas($("chartTraits"));
+    const d = traitsChartData();
+    const hi = hoverIndex("traits", d.ticks.length);
+    const sh = (h - 34) / 2;
+    drawStrip(c, { x: PAD_L, y: 6, w: w - PAD_L - PAD_R, h: sh }, d.ticks,
+      [{ color: DIET_COLOR, values: d.diet }], 0, 1, [0, 0.5, 1], hi);
+    drawStrip(c, { x: PAD_L, y: 28 + sh, w: w - PAD_L - PAD_R, h: sh }, d.ticks,
+      [{ color: SIZE_COLOR, values: d.size }], 0.5, 3, [0.5, 1.75, 3], hi);
+    const at = (arr) => (hi !== null ? arr[hi] : arr[arr.length - 1]);
+    $("legendTraits").innerHTML = d.ticks.length ?
+      `<span><i style="background:${DIET_COLOR}"></i>Diet <b>${at(d.diet).toFixed(2)}</b></span>` +
+      `<span><i style="background:${SIZE_COLOR}"></i>Size <b>${at(d.size).toFixed(2)}</b></span>` : "";
+    $("tipTraits").textContent = hi !== null ? `tick ${d.ticks[hi].toLocaleString()}` : "";
+  }
+}
+
+for (const [key, id] of [["species", "chartSpecies"], ["traits", "chartTraits"]]) {
+  const cv = $(id);
+  const move = (e) => {
+    const r = cv.getBoundingClientRect();
+    chartHover[key] = Math.max(0, Math.min(1, (e.clientX - r.left - PAD_L) / (r.width - PAD_L - PAD_R)));
+    drawCharts();
+  };
+  cv.addEventListener("pointermove", move);
+  cv.addEventListener("pointerdown", move);
+  cv.addEventListener("pointerleave", () => { chartHover[key] = null; drawCharts(); });
+}
+
+/* ---------- Events list ---------- */
+const EVENT_ICON = { firstPredator: "🦷", extinction: "💀", crash: "📉", boom: "📈", newSpecies: "🌱", allDead: "☠️" };
+function updateEvents() {
+  const evs = runEvents(sim).slice(-8).reverse();
+  $("eventList").innerHTML = evs.length ? evs.map((e) =>
+    `<li><span>${EVENT_ICON[e.type]}</span><span>${e.note}</span><small>${e.tick.toLocaleString()}</small></li>`).join("")
+    : `<li class="empty">Nothing yet.</li>`;
+}
+
 function refreshAll() {
   draw();
   updateStats();
   updateSpeciesList();
   updateInspector();
   updateProgress();
+  drawCharts();
+  updateEvents();
 }
 
 /* ---------- Running ---------- */
@@ -897,6 +1158,7 @@ function finishRun() {
 
 function newWorld() {
   sim = new Sim(readSettings());
+  chartSlots = new Map();
   selected = null;
   runTarget = null;
   $("doneMsg").hidden = true;
@@ -930,8 +1192,14 @@ function loop() {
     updateStats();
     updateProgress();
     if (selected) updateInspector();
-    if (++frame % (turbo ? 30 : 15) === 0) updateSpeciesList();
+    if (++frame % (turbo ? 30 : 15) === 0) { updateSpeciesList(); drawCharts(); updateEvents(); }
     if (runTarget !== null && sim.tick >= runTarget) finishRun();
+    else if (sim.creatures.length === 0) {
+      runTarget = null;
+      setRunning(false);
+      $("doneMsg").hidden = false;
+      $("doneMsg").textContent = `☠️ Every creature died at tick ${sim.tick.toLocaleString()}.`;
+    }
   }
   requestAnimationFrame(loop);
 }
