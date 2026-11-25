@@ -79,6 +79,8 @@
   details { background: var(--panel-2); border-radius: 6px; padding: 8px 10px; margin-bottom: 10px; }
   summary { cursor: pointer; font-weight: 600; }
   details[open] summary { margin-bottom: 8px; }
+  details.sub { background: var(--panel); margin: 0 0 10px; }
+  details.sub summary { font-weight: 500; font-size: 13px; color: var(--muted); }
   .presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
   .presets button { font-size: 13px; padding: 5px 8px; background: var(--panel); }
   .form { display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center; margin-bottom: 10px; }
@@ -153,6 +155,10 @@
       <label class="chk"><input type="checkbox" id="chkTurbo"> Turbo</label>
     </div>
     <div class="row">
+      <label class="chk" title="Drop to 1× and pause on first omnivore, first predator or a crash (after the first 1,000 ticks)">
+        <input type="checkbox" id="chkPauseEv"> Pause on events</label>
+    </div>
+    <div class="row">
       <label for="inSpeed">Speed</label>
       <input id="inSpeed" type="range" min="0" max="100" value="26">
       <span id="speedLbl" class="mono">4×</span>
@@ -208,6 +214,20 @@
         <label for="setSeasons">Seasons</label><input id="setSeasons" type="checkbox" checked>
         <label for="setThresh">Species threshold</label><input id="setThresh" type="number" value="0.25" min="0.05" max="2" step="0.01">
       </div>
+      <details id="advanced" class="sub">
+        <summary>Advanced</summary>
+        <div class="form">
+          <label for="setPrey" title="A creature can only eat another smaller than this × its own size">Prey size rule</label>
+          <input id="setPrey" type="number" value="0.8" min="0.5" max="1" step="0.05">
+          <label for="setJump">Big-jump chance</label>
+          <input id="setJump" type="number" value="0.01" min="0" max="1" step="0.01">
+          <label for="setMutSize">Mutation size</label>
+          <input id="setMutSize" type="number" value="0.08" min="0" max="1" step="0.01">
+        </div>
+        <small class="note" style="margin:0">Prey size rule: a creature can only eat another smaller than this × its own size (0.5–1.0).
+          Big-jump chance: how often a newborn gets one gene completely re-rolled. Mutation size: the biggest
+          normal nudge, as a share of each gene's range.</small>
+      </details>
       <div class="row">
         <button id="btnApply">🌍 New world</button>
         <span id="presetLbl" class="note" style="margin:0">Calm Meadow</span>
@@ -241,7 +261,7 @@
 
 <script>
 "use strict";
-const APP_VERSION = "0.7.2";
+const APP_VERSION = "0.8.0";
 
 /* ================= Seeded random (mulberry32) ================= */
 // All randomness in the sim must come from here. Never Math.random().
@@ -314,6 +334,7 @@ const DEFAULTS = {
   mutationRate: 0.15,     // chance each gene mutates at birth
   mutationSize: 0.08,     // max nudge, as a share of the gene's range
   bigJumpRate: 0.01,      // chance a newborn gets one gene re-rolled anywhere in its range
+  preyRatio: 0.8,         // a creature can only eat another smaller than this × its own size
   speciesThreshold: 0.25, // genome distance from the species founder that starts a new species
   starter: {},            // gene overrides for the starting creatures
 };
@@ -328,7 +349,6 @@ const TUNE = {
   corpseFood: 0.3,        // plant food left on the tile per unit of size
   meatValue: 0.8,         // (prey energy + body) × diet × this
   bodyEnergy: 3,          // extra meat per unit of prey size, on top of its stored energy
-  attackRatio: 0.8,       // can only attack prey under this × own size
   threatDiet: 0.5,        // others above this diet count as meat eaters to flee from
   hueDrift: 4,            // hue wanders ± this every birth so families look alike
   biteBase: 0,            // plant appetite per tick = biteBase + biteSize × size
@@ -432,7 +452,7 @@ function runEvents(sim) {
     const keep = new Set(evs.filter((e) => e.type === type).sort((a, b) => swingSize(b) - swingSize(a) || a.tick - b.tick).slice(0, MAX_SWINGS));
     for (let i = evs.length - 1; i >= 0; i--) if (evs[i].type === type && !keep.has(evs[i])) evs.splice(i, 1);
   }
-  const rank = { firstPredator: 0, allDead: 0, extinction: 1, crash: 2, boom: 2, newSpecies: 3 };
+  const rank = { firstOmnivore: 0, firstPredator: 0, allDead: 0, extinction: 1, crash: 2, boom: 2, newSpecies: 3 };
   evs.sort((a, b) => rank[a.type] - rank[b.type] || a.tick - b.tick);
   return evs.slice(0, MAX_EVENTS).sort((a, b) => a.tick - b.tick);
 }
@@ -511,6 +531,7 @@ function buildReport(sim, notes) {
       },
       settings: {
         world: [sim.W, sim.H], startPop: st.startPop, mutationRate: st.mutationRate, mutationSize: st.mutationSize,
+        bigJumpRate: st.bigJumpRate, preyRatio: st.preyRatio,
         seasons: st.seasons, speciesThreshold: st.speciesThreshold, preset: st.preset || "Custom",
       },
       timeline: { every, cols: TIMELINE_COLS, rows: reportTimeline(sim, every) },
@@ -566,8 +587,8 @@ class Sim {
     // History, sampled every SAMPLE_EVERY ticks (feeds the charts and the Run Report).
     this.timeline = [];      // rows: see TIMELINE_COLS
     this.recent = [];        // last 101 samples of per-species counts, for the species chart
-    this.events = [];        // firstPredator, crash, boom, allDead (species events are derived later)
-    this.flags = { firstPredator: false, allDead: false, lastCrash: -Infinity, lastBoom: -Infinity };
+    this.events = [];        // firstOmnivore, firstPredator, crash, boom, allDead (species events are derived later)
+    this.flags = { firstOmnivore: false, firstPredator: false, allDead: false, lastCrash: -Infinity, lastBoom: -Infinity };
     this.swings = { crash: [], boom: [] }; // every boom/crash detected, logged or not (for spotting yearly cycles)
     this.sampleBirths = 0; this.sampleDeaths = 0;
     this.spawnStarters();
@@ -617,6 +638,11 @@ class Sim {
         for (const n of TRAIT_NAMES) s.peakGenes[n] = t[n] / t.n;
       }
       // First predator: a species averaging diet over 0.6 reaches 20 creatures.
+      // First omnivore: a species averaging diet over 0.4 reaches 20 creatures.
+      if (!this.flags.firstOmnivore && t.n >= 20 && t.diet / t.n > 0.4) {
+        this.flags.firstOmnivore = true;
+        this.addEvent({ tick: this.tick, type: "firstOmnivore", species: sp, note: "diet crossed 0.4" });
+      }
       if (!this.flags.firstPredator && t.n >= 20 && t.diet / t.n > 0.6) {
         this.flags.firstPredator = true;
         this.addEvent({ tick: this.tick, type: "firstPredator", species: sp, note: "diet crossed 0.6" });
@@ -723,7 +749,8 @@ class Sim {
     // --- Sense other creatures: best prey, and threats to run from.
     const cs = this.creatures, head = this.cellHead, next = this.cellNext;
     const R = g.sense, R2 = R * R;
-    const huntable = TUNE.attackRatio * g.size;
+    const preyRatio = this.settings.preyRatio;
+    const huntable = preyRatio * g.size;
     let prey = null, preyScore = 0, preyDx = 0, preyDy = 0;
     let ax = 0, ay = 0; // flee vector
     const r = Math.ceil(R / CELL);
@@ -743,7 +770,7 @@ class Sim {
           if (o.g.size < huntable) {
             const s = (g.diet * o.energy) / d;
             if (s > preyScore) { preyScore = s; prey = o; preyDx = dx; preyDy = dy; }
-          } else if (o.g.diet > TUNE.threatDiet && g.size < TUNE.attackRatio * o.g.size) {
+          } else if (o.g.diet > TUNE.threatDiet && g.size < preyRatio * o.g.size) {
             const w = o.g.diet / (d * d);
             ax -= dx * w; ay -= dy * w;
           }
@@ -985,16 +1012,19 @@ let runTarget = null;       // tick to stop at for "Run for…"
 // Each preset fills the settings form, plus a few hidden world settings.
 const PRESETS = {
   "Calm Meadow": {
-    form: { world: "200x140", startPop: 120, mutationRate: 0.15, seasons: true, speciesThreshold: 0.25 },
-    extra: { regrowRate: 0.004, fertileShift: 0.25, seasonAmp: 0.4, mutationSize: 0.08, bigJumpRate: 0.01, starter: {} },
+    form: { world: "200x140", startPop: 120, mutationRate: 0.15, seasons: true, speciesThreshold: 0.25,
+      preyRatio: 0.8, bigJumpRate: 0.01, mutationSize: 0.08 },
+    extra: { regrowRate: 0.004, fertileShift: 0.25, seasonAmp: 0.4, starter: {} },
   },
   "Harsh Desert": {
-    form: { world: "200x140", startPop: 120, mutationRate: 0.15, seasons: true, speciesThreshold: 0.25 },
-    extra: { regrowRate: 0.003, fertileShift: 0.42, seasonAmp: 0.6, mutationSize: 0.08, bigJumpRate: 0.01, starter: {} },
+    form: { world: "200x140", startPop: 120, mutationRate: 0.15, seasons: true, speciesThreshold: 0.25,
+      preyRatio: 0.8, bigJumpRate: 0.01, mutationSize: 0.08 },
+    extra: { regrowRate: 0.003, fertileShift: 0.42, seasonAmp: 0.6, starter: {} },
   },
   "Predator Island": {
-    form: { world: "120x84", startPop: 120, mutationRate: 0.25, seasons: true, speciesThreshold: 0.25 },
-    extra: { regrowRate: 0.006, fertileShift: 0.1, seasonAmp: 0.3, mutationSize: 0.15, bigJumpRate: 0.1, starter: {} },
+    form: { world: "120x84", startPop: 120, mutationRate: 0.25, seasons: true, speciesThreshold: 0.25,
+      preyRatio: 0.8, bigJumpRate: 0.1, mutationSize: 0.15 },
+    extra: { regrowRate: 0.006, fertileShift: 0.1, seasonAmp: 0.3, starter: {} },
   },
 };
 let presetName = "Calm Meadow";
@@ -1009,6 +1039,9 @@ function applyPresetToForm(name) {
   $("setMut").value = p.form.mutationRate;
   $("setSeasons").checked = p.form.seasons;
   $("setThresh").value = p.form.speciesThreshold;
+  $("setPrey").value = p.form.preyRatio;
+  $("setJump").value = p.form.bigJumpRate;
+  $("setMutSize").value = p.form.mutationSize;
   $("presetLbl").textContent = name;
 }
 
@@ -1025,6 +1058,9 @@ function readSettings() {
     mutationRate: num("setMut", 0.15, 0, 1),
     seasons: $("setSeasons").checked,
     speciesThreshold: num("setThresh", 0.25, 0.05, 2),
+    preyRatio: num("setPrey", 0.8, 0.5, 1),
+    bigJumpRate: num("setJump", 0.01, 0, 1),
+    mutationSize: num("setMutSize", 0.08, 0, 1),
     preset: $("presetLbl").textContent,
   });
 }
@@ -1251,7 +1287,7 @@ for (const [key, id] of [["species", "chartSpecies"], ["traits", "chartTraits"]]
 }
 
 /* ---------- Events list ---------- */
-const EVENT_ICON = { firstPredator: "🦷", extinction: "💀", crash: "📉", boom: "📈", newSpecies: "🌱", allDead: "☠️" };
+const EVENT_ICON = { firstOmnivore: "🍗", firstPredator: "🦷", extinction: "💀", crash: "📉", boom: "📈", newSpecies: "🌱", allDead: "☠️" };
 function updateEvents() {
   const evs = runEvents(sim).slice(-8).reverse();
   $("eventList").innerHTML = evs.length ? evs.map((e) =>
@@ -1402,24 +1438,54 @@ function newWorld() {
 }
 
 let frame = 0;
+const PAUSE_ON = { firstOmnivore: "first omnivore", firstPredator: "first predator", crash: "a crash" };
+let pausedFor = null;  // the event that just paused the run
+const PAUSE_SETTLE = 1000;
+
+// One step, then report whether we must stop: run target reached, or a watched event just happened.
+function stepAndCheck() {
+  const before = sim.events.length;
+  sim.step();
+  if (runTarget !== null && sim.tick >= runTarget) return true;
+  if ($("chkPauseEv").checked) {
+    for (let i = before; i < sim.events.length; i++) {
+      // Skip the first 1,000 ticks: every world booms and crashes once while it settles in.
+      if (PAUSE_ON[sim.events[i].type] && sim.events[i].tick > PAUSE_SETTLE) { pausedFor = sim.events[i]; return true; }
+    }
+  }
+  return false;
+}
+
+function pauseForEvent(e) {
+  pausedFor = null;
+  $("chkTurbo").checked = false;
+  $("inSpeed").value = 0;
+  $("speedLbl").textContent = ticksPerFrame() + "×";
+  setRunning(false);
+  const sp = e.species ? ` (${sim.species[e.species].name})` : "";
+  $("doneMsg").hidden = false;
+  $("doneMsg").textContent = `⏸ Paused for ${PAUSE_ON[e.type]}${sp} at tick ${e.tick.toLocaleString()}: ${e.note}. ` +
+    `Speed is now 1×. Press Play to watch.`;
+  if (e.species) {
+    // Inspect one of the species involved, so it's easy to find on the map.
+    selected = sim.creatures.find((c) => c.sp === e.species) || null;
+    refreshAll();
+  }
+}
+
 function loop() {
   if (running) {
     const t0 = performance.now();
     const turbo = $("chkTurbo").checked;
+    let stop = runTarget !== null && sim.tick >= runTarget;
     if (turbo) {
       // Simulate in chunks until ~30 ms of this frame is used, then hand back to the browser.
-      do {
-        for (let i = 0; i < 10; i++) {
-          if (runTarget !== null && sim.tick >= runTarget) break;
-          sim.step();
-        }
-      } while (performance.now() - t0 < 30 && !(runTarget !== null && sim.tick >= runTarget));
+      while (!stop && performance.now() - t0 < 30) {
+        for (let i = 0; i < 10 && !stop; i++) stop = stepAndCheck();
+      }
     } else {
       const n = ticksPerFrame();
-      for (let i = 0; i < n; i++) {
-        if (runTarget !== null && sim.tick >= runTarget) break;
-        sim.step();
-      }
+      for (let i = 0; i < n && !stop; i++) stop = stepAndCheck();
     }
     sim.wallMs += performance.now() - t0;
 
@@ -1428,7 +1494,8 @@ function loop() {
     updateProgress();
     if (selected) updateInspector();
     if (++frame % (turbo ? 30 : 15) === 0) { updateSpeciesList(); drawCharts(); updateEvents(); }
-    if (runTarget !== null && sim.tick >= runTarget) finishRun();
+    if (pausedFor) pauseForEvent(pausedFor);
+    else if (runTarget !== null && sim.tick >= runTarget) finishRun();
     else if (sim.creatures.length === 0) {
       runTarget = null;
       setRunning(false);
@@ -1472,7 +1539,7 @@ $("btnApply").onclick = () => { setRunning(false); newWorld(); };
 for (const b of document.querySelectorAll("[data-preset]")) {
   b.onclick = () => { applyPresetToForm(b.dataset.preset); markSettingsDirty(); };
 }
-for (const id of ["setWorld", "setPop", "setMut", "setSeasons", "setThresh"]) {
+for (const id of ["setWorld", "setPop", "setMut", "setSeasons", "setThresh", "setPrey", "setJump", "setMutSize"]) {
   $(id).addEventListener("input", () => { $("presetLbl").textContent = presetName + " (edited)"; markSettingsDirty(); });
 }
 $("setSeed").addEventListener("input", markSettingsDirty);
