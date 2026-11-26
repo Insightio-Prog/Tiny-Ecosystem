@@ -227,12 +227,15 @@
           <input id="setEscape" type="checkbox">
           <label for="setEscStr">Escape strength</label>
           <input id="setEscStr" type="number" value="0.75" min="0.3" max="1" step="0.05">
+          <label for="setMeat">Meat efficiency</label>
+          <input id="setMeat" type="number" value="0.8" min="0.1" max="1" step="0.05">
         </div>
         <small class="note" style="margin:0">Prey size rule: a creature can only eat another smaller than this × its own size (0.5–1.0).
           Big-jump chance: how often a newborn gets one gene completely re-rolled. Mutation size: the biggest
           normal nudge, as a share of each gene's range. Escape chance: when on, prey escape an attack with
           chance strength × (prey speed ÷ hunter speed) + 0.2 × prey fear (between 5% and 95%), and a failed attack costs
-          the hunter 2% of its max energy. Escape strength (0.3–1.0): higher means prey get away more often.</small>
+          the hunter 2% of its max energy. Escape strength (0.3–1.0): higher means prey get away more often.
+          Meat efficiency (0.1–1.0): how much of a meal's energy a hunter keeps.</small>
       </details>
       <div class="row">
         <button id="btnApply">🌍 New world</button>
@@ -267,7 +270,7 @@
 
 <script>
 "use strict";
-const APP_VERSION = "0.9.2";
+const APP_VERSION = "0.9.3";
 
 /* ================= Seeded random (mulberry32) ================= */
 // All randomness in the sim must come from here. Never Math.random().
@@ -343,6 +346,7 @@ const DEFAULTS = {
   preyRatio: 0.8,         // a creature can only eat another smaller than this × its own size
   escapeOn: false,        // prey may escape: clamp(escapeStrength × prey/hunter speed + 0.2 × prey fear, 0.05, 0.95)
   escapeStrength: 0.75,   // how much prey speed helps it escape (0.3–1.0)
+  meatEfficiency: 0.8,    // eating a creature gives (its energy + body) × diet × this (0.1–1.0)
   speciesThreshold: 0.25, // genome distance from the species founder that starts a new species
   starter: {},            // gene overrides for the starting creatures
 };
@@ -355,7 +359,6 @@ const TUNE = {
   startEnergy: 0.5,       // first generation starts at this share of max
   maxAge: 1500,
   corpseFood: 0.3,        // plant food left on the tile per unit of size
-  meatValue: 0.8,         // (prey energy + body) × diet × this
   bodyEnergy: 3,          // extra meat per unit of prey size, on top of its stored energy
   threatDiet: 0.5,        // others above this diet count as meat eaters to flee from
   hueDrift: 4,            // hue wanders ± this every birth so families look alike
@@ -549,7 +552,7 @@ function buildReport(sim, notes) {
       },
       settings: {
         world: [sim.W, sim.H], startPop: st.startPop, mutationRate: st.mutationRate, mutationSize: st.mutationSize,
-        bigJumpRate: st.bigJumpRate, preyRatio: st.preyRatio, escapeOn: st.escapeOn, escapeStrength: st.escapeStrength,
+        bigJumpRate: st.bigJumpRate, preyRatio: st.preyRatio, escapeOn: st.escapeOn, escapeStrength: st.escapeStrength, meatEfficiency: st.meatEfficiency,
         seasons: st.seasons, speciesThreshold: st.speciesThreshold, preset: st.preset || "Custom",
       },
       timeline: { every, cols: TIMELINE_COLS, rows: reportTimeline(sim, every) },
@@ -829,7 +832,7 @@ class Sim {
       let dx = prey.x - c.x; if (dx > W / 2) dx -= W; else if (dx < -W / 2) dx += W;
       let dy = prey.y - c.y; if (dy > H / 2) dy -= H; else if (dy < -H / 2) dy += H;
       const reach = 0.5 + 0.35 * (g.size + prey.g.size);
-      const meatGain = (prey.energy + TUNE.bodyEnergy * prey.g.size) * g.diet * TUNE.meatValue;
+      const meatGain = (prey.energy + TUNE.bodyEnergy * prey.g.size) * g.diet * this.settings.meatEfficiency;
       if (dx * dx + dy * dy <= reach * reach && meatGain > plantGain) {
         // Attack! Escape ON: the prey's speed and fear help it get away. OFF: the original catch chance.
         let caught;
@@ -1051,17 +1054,17 @@ let runTarget = null;       // tick to stop at for "Run for…"
 const PRESETS = {
   "Calm Meadow": {
     form: { world: "200x140", startPop: 120, mutationRate: 0.15, seasons: true, speciesThreshold: 0.25,
-      preyRatio: 0.8, escapeOn: false, escapeStrength: 0.75, bigJumpRate: 0.01, mutationSize: 0.08 },
+      preyRatio: 0.8, escapeOn: false, escapeStrength: 0.75, meatEfficiency: 0.8, bigJumpRate: 0.01, mutationSize: 0.08 },
     extra: { regrowRate: 0.004, fertileShift: 0.25, seasonAmp: 0.4, starter: {} },
   },
   "Harsh Desert": {
     form: { world: "200x140", startPop: 120, mutationRate: 0.15, seasons: true, speciesThreshold: 0.25,
-      preyRatio: 0.8, escapeOn: false, escapeStrength: 0.75, bigJumpRate: 0.01, mutationSize: 0.08 },
+      preyRatio: 0.8, escapeOn: false, escapeStrength: 0.75, meatEfficiency: 0.8, bigJumpRate: 0.01, mutationSize: 0.08 },
     extra: { regrowRate: 0.003, fertileShift: 0.42, seasonAmp: 0.6, starter: {} },
   },
   "Predator Island": {
     form: { world: "120x84", startPop: 120, mutationRate: 0.25, seasons: true, speciesThreshold: 0.25,
-      preyRatio: 0.8, escapeOn: false, escapeStrength: 0.75, bigJumpRate: 0.1, mutationSize: 0.15 },
+      preyRatio: 0.8, escapeOn: false, escapeStrength: 0.75, meatEfficiency: 0.8, bigJumpRate: 0.1, mutationSize: 0.15 },
     extra: { regrowRate: 0.006, fertileShift: 0.1, seasonAmp: 0.3, starter: {} },
   },
 };
@@ -1080,6 +1083,7 @@ function applyPresetToForm(name) {
   $("setPrey").value = p.form.preyRatio;
   $("setEscape").checked = p.form.escapeOn;
   $("setEscStr").value = p.form.escapeStrength;
+  $("setMeat").value = p.form.meatEfficiency;
   $("setJump").value = p.form.bigJumpRate;
   $("setMutSize").value = p.form.mutationSize;
   $("presetLbl").textContent = name;
@@ -1101,6 +1105,7 @@ function readSettings() {
     preyRatio: num("setPrey", 0.8, 0.5, 1),
     escapeOn: $("setEscape").checked,
     escapeStrength: num("setEscStr", 0.75, 0.3, 1),
+    meatEfficiency: num("setMeat", 0.8, 0.1, 1),
     bigJumpRate: num("setJump", 0.01, 0, 1),
     mutationSize: num("setMutSize", 0.08, 0, 1),
     preset: $("presetLbl").textContent,
@@ -1581,7 +1586,7 @@ $("btnApply").onclick = () => { setRunning(false); newWorld(); };
 for (const b of document.querySelectorAll("[data-preset]")) {
   b.onclick = () => { applyPresetToForm(b.dataset.preset); markSettingsDirty(); };
 }
-for (const id of ["setWorld", "setPop", "setMut", "setSeasons", "setThresh", "setPrey", "setJump", "setMutSize", "setEscape", "setEscStr"]) {
+for (const id of ["setWorld", "setPop", "setMut", "setSeasons", "setThresh", "setPrey", "setJump", "setMutSize", "setEscape", "setEscStr", "setMeat"]) {
   $(id).addEventListener("input", () => { $("presetLbl").textContent = presetName + " (edited)"; markSettingsDirty(); });
 }
 $("setSeed").addEventListener("input", markSettingsDirty);
