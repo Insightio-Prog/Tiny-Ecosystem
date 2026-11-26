@@ -229,7 +229,7 @@
         <small class="note" style="margin:0">Prey size rule: a creature can only eat another smaller than this × its own size (0.5–1.0).
           Big-jump chance: how often a newborn gets one gene completely re-rolled. Mutation size: the biggest
           normal nudge, as a share of each gene's range. Escape chance: when on, prey escape an attack with
-          chance 0.5 × (prey speed ÷ hunter speed) + 0.2 × prey fear (max 90%), and a failed attack costs the
+          chance 0.75 × (prey speed ÷ hunter speed) + 0.2 × prey fear (between 5% and 95%), and a failed attack costs the
           hunter 2% of its max energy.</small>
       </details>
       <div class="row">
@@ -265,7 +265,7 @@
 
 <script>
 "use strict";
-const APP_VERSION = "0.9.0";
+const APP_VERSION = "0.9.1";
 
 /* ================= Seeded random (mulberry32) ================= */
 // All randomness in the sim must come from here. Never Math.random().
@@ -339,7 +339,7 @@ const DEFAULTS = {
   mutationSize: 0.08,     // max nudge, as a share of the gene's range
   bigJumpRate: 0.01,      // chance a newborn gets one gene re-rolled anywhere in its range
   preyRatio: 0.8,         // a creature can only eat another smaller than this × its own size
-  escapeOn: false,        // prey may escape: chance from prey speed ÷ hunter speed and prey fear
+  escapeOn: false,        // prey may escape: clamp(0.75 × prey/hunter speed + 0.2 × prey fear, 0.05, 0.95)
   speciesThreshold: 0.25, // genome distance from the species founder that starts a new species
   starter: {},            // gene overrides for the starting creatures
 };
@@ -821,7 +821,7 @@ class Sim {
         // Attack! Escape ON: the prey's speed and fear help it get away. OFF: the original catch chance.
         let caught;
         if (this.settings.escapeOn) {
-          const esc = Math.min(0.9, Math.max(0, 0.5 * (prey.g.speed / g.speed) + 0.2 * prey.g.fear));
+          const esc = Math.min(0.95, Math.max(0.05, 0.75 * (prey.g.speed / g.speed) + 0.2 * prey.g.fear));
           caught = this.rng() >= esc;
         } else {
           caught = this.rng() < Math.min(0.95, TUNE.catchChance * g.speed / prey.g.speed);
