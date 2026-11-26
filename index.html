@@ -71,6 +71,11 @@
   .mono { font-variant-numeric: tabular-nums; min-width: 44px; text-align: right; }
   #progress { margin-bottom: 10px; }
   .bar { height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
+  .expset { display: grid; grid-template-columns: 1fr auto; gap: 1px 10px; font-size: 12px; background: var(--panel);
+    border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; font-variant-numeric: tabular-nums; }
+  .expset .hd { grid-column: 1 / -1; color: var(--muted); margin-bottom: 2px; }
+  .expset .v { text-align: right; }
+  .expset .vary { color: var(--accent); font-weight: 600; }
   #expFill { height: 100%; width: 0; background: var(--accent); }
   #expProgress { margin: 8px 0; }
   .form input[type=text] { font: inherit; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; width: 100%; }
@@ -210,6 +215,7 @@
         <label for="expTicks">Ticks per run</label>
         <input id="expTicks" type="number" value="50000" step="1000" min="100">
       </div>
+      <div id="expSettings" class="expset"></div>
       <div class="row">
         <button id="btnExpStart">▶ Start experiment</button>
         <button id="btnExpStop" disabled>⏹ Stop</button>
@@ -272,13 +278,17 @@
           <input id="setEscStr" type="number" value="0.75" min="0.3" max="1" step="0.05">
           <label for="setMeat">Meat efficiency</label>
           <input id="setMeat" type="number" value="0.8" min="0.1" max="1" step="0.05">
+          <label for="setCover">Refuge cover</label>
+          <input id="setCover" type="number" value="0" min="0" max="0.3" step="0.05">
         </div>
         <small class="note" style="margin:0">Prey size rule: a creature can only eat another smaller than this × its own size (0.5–1.0).
           Big-jump chance: how often a newborn gets one gene completely re-rolled. Mutation size: the biggest
           normal nudge, as a share of each gene's range. Escape chance: when on, prey escape an attack with
           chance strength × (prey speed ÷ hunter speed) + 0.2 × prey fear (between 5% and 95%), and a failed attack costs
           the hunter 2% of its max energy. Escape strength (0.3–1.0): higher means prey get away more often.
-          Meat efficiency (0.1–1.0): how much of a meal's energy a hunter keeps.</small>
+          Meat efficiency (0.1–1.0): how much of a meal's energy a hunter keeps.
+          Refuge cover (0–0.3): share of the map that is thick cover (dark green clumps). Nothing can be attacked
+          while standing in it, and plants there grow at half speed.</small>
       </details>
       <div class="row">
         <button id="btnApply">🌍 New world</button>
@@ -313,7 +323,7 @@
 
 <script>
 "use strict";
-const APP_VERSION = "0.10.1";
+const APP_VERSION = "0.11.0";
 
 /* ================= Seeded random (mulberry32) ================= */
 // All randomness in the sim must come from here. Never Math.random().
@@ -373,6 +383,36 @@ function makeFertility(W, H, rng, shift) {
   return out;
 }
 
+/* ================= Refuge cover ================= */
+// Thick cover in seeded clumps: the `frac` share of tiles with the highest value on a wrapping noise map.
+function makeCover(W, H, seed, frac) {
+  const cover = new Uint8Array(W * H);
+  if (!(frac > 0)) return cover;
+  const rng = mulberry32((seed ^ 0x5bd1e995) >>> 0);
+  const noise = new Float32Array(W * H);
+  const smooth = (t) => t * t * (3 - 2 * t);
+  for (const o of [{ cells: 10, amp: 1 }, { cells: 20, amp: 0.5 }, { cells: 40, amp: 0.25 }]) {
+    const cx = o.cells, cy = Math.max(2, Math.round(o.cells * H / W));
+    const lat = new Float32Array(cx * cy);
+    for (let i = 0; i < lat.length; i++) lat[i] = rng();
+    for (let y = 0; y < H; y++) {
+      const fy = (y / H) * cy, y0 = Math.floor(fy), ty = smooth(fy - y0);
+      const r0 = (y0 % cy) * cx, r1 = ((y0 + 1) % cy) * cx;
+      for (let x = 0; x < W; x++) {
+        const fx = (x / W) * cx, x0 = Math.floor(fx), tx = smooth(fx - x0);
+        const c0 = x0 % cx, c1 = (x0 + 1) % cx;
+        const a = lat[r0 + c0], b = lat[r0 + c1], c = lat[r1 + c0], d = lat[r1 + c1];
+        noise[y * W + x] += ((a + (b - a) * tx) * (1 - ty) + (c + (d - c) * tx) * ty) * o.amp;
+      }
+    }
+  }
+  const n = Math.round(Math.min(0.3, frac) * W * H);
+  const cut = Float32Array.from(noise).sort()[W * H - n];
+  let made = 0;
+  for (let i = 0; i < W * H && made < n; i++) if (noise[i] >= cut) { cover[i] = 1; made++; }
+  return cover;
+}
+
 /* ================= Settings ================= */
 const DEFAULTS = {
   seed: 42,
@@ -390,6 +430,7 @@ const DEFAULTS = {
   escapeOn: false,        // prey may escape: clamp(escapeStrength × prey/hunter speed + 0.2 × prey fear, 0.05, 0.95)
   escapeStrength: 0.75,   // how much prey speed helps it escape (0.3–1.0)
   meatEfficiency: 0.8,    // eating a creature gives (its energy + body) × diet × this (0.1–1.0)
+  refugeCover: 0,         // share of tiles that are thick cover: no attacks there, plants grow at half speed (0–0.3)
   speciesThreshold: 0.25, // genome distance from the species founder that starts a new species
   starter: {},            // gene overrides for the starting creatures
 };
@@ -600,7 +641,7 @@ function buildReport(sim, notes) {
       },
       settings: {
         world: [sim.W, sim.H], startPop: st.startPop, mutationRate: st.mutationRate, mutationSize: st.mutationSize,
-        bigJumpRate: st.bigJumpRate, preyRatio: st.preyRatio, escapeOn: st.escapeOn, escapeStrength: st.escapeStrength, meatEfficiency: st.meatEfficiency,
+        bigJumpRate: st.bigJumpRate, preyRatio: st.preyRatio, escapeOn: st.escapeOn, escapeStrength: st.escapeStrength, meatEfficiency: st.meatEfficiency, refugeCover: st.refugeCover,
         seasons: st.seasons, speciesThreshold: st.speciesThreshold, preset: st.preset || "Custom",
       },
       timeline: { every, cols: TIMELINE_COLS, rows: reportTimeline(sim, every) },
@@ -637,6 +678,8 @@ class Sim {
     this.tick = 0;
     this.wallMs = 0;        // real time spent simulating (for the report)
     this.fertility = makeFertility(W, H, this.rng, this.settings.fertileShift);
+    // Refuge cover uses its own random stream, so a world with no cover plays out exactly as before.
+    this.cover = makeCover(W, H, this.settings.seed, this.settings.refugeCover);
     this.food = new Float32Array(W * H);
     // Start each tile part-way to its fertile maximum.
     for (let i = 0; i < this.food.length; i++) this.food[i] = this.fertility[i] * (0.6 + 0.4 * this.rng());
@@ -844,6 +887,7 @@ class Sim {
           if (d2 > R2) continue;
           const d = Math.sqrt(d2) + 0.5;
           if (o.g.size < huntable) {
+            if (this.cover[((o.y | 0) * W) + (o.x | 0)]) continue; // safe in cover: can't be attacked
             const s = (g.diet * o.energy) / d;
             if (s > preyScore) { preyScore = s; prey = o; preyDx = dx; preyDy = dy; }
           } else if (o.g.diet > TUNE.threatDiet && g.size < preyRatio * o.g.size) {
@@ -876,7 +920,7 @@ class Sim {
     const appetite = TUNE.biteBase + TUNE.biteSize * g.size;
     const plantGain = Math.min(food[ti], appetite) * plantTaste;
     let ate = false;
-    if (prey && !prey.dead && g.diet >= TUNE.minAttackDiet) {
+    if (prey && !prey.dead && g.diet >= TUNE.minAttackDiet && !this.cover[((prey.y | 0) * W) + (prey.x | 0)]) {
       let dx = prey.x - c.x; if (dx > W / 2) dx -= W; else if (dx < -W / 2) dx += W;
       let dy = prey.y - c.y; if (dy > H / 2) dy -= H; else if (dy < -H / 2) dy += H;
       const reach = 0.5 + 0.35 * (g.size + prey.g.size);
@@ -979,9 +1023,10 @@ class Sim {
   step() {
     const food = this.food, fert = this.fertility;
     const g = this.settings.regrowRate * this.seasonFactor();
+    const cover = this.cover;
     for (let i = 0; i < food.length; i++) {
-      // Tiles regrow toward their own fertile maximum, so deserts stay poor.
-      const cap = fert[i], f = food[i] + g * cap;
+      // Tiles regrow toward their own fertile maximum, so deserts stay poor. Cover grows at half speed.
+      const cap = fert[i], f = food[i] + (cover[i] ? 0.5 * g : g) * cap;
       food[i] = f > cap ? cap : f;
     }
 
@@ -1022,6 +1067,8 @@ let tileCanvas, tileCtx, tileImg;
 // Sand (no food) -> green (full food)
 const SAND = [214, 196, 150], GREEN = [46, 130, 52];
 const PALETTE = new Uint32Array(256);
+const COVER_BARE = [58, 82, 50], COVER_FULL = [16, 62, 30];
+const PALETTE_COVER = new Uint32Array(256);
 (function buildPalette() {
   const little = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
   for (let i = 0; i < 256; i++) {
@@ -1030,6 +1077,11 @@ const PALETTE = new Uint32Array(256);
     const g = Math.round(SAND[1] + (GREEN[1] - SAND[1]) * t);
     const b = Math.round(SAND[2] + (GREEN[2] - SAND[2]) * t);
     PALETTE[i] = little ? (255 << 24) | (b << 16) | (g << 8) | r : (r << 24) | (g << 16) | (b << 8) | 255;
+    // Thick cover: dark green, a little lighter where its plants have been eaten.
+    const cr = Math.round(COVER_BARE[0] + (COVER_FULL[0] - COVER_BARE[0]) * t);
+    const cg = Math.round(COVER_BARE[1] + (COVER_FULL[1] - COVER_BARE[1]) * t);
+    const cb = Math.round(COVER_BARE[2] + (COVER_FULL[2] - COVER_BARE[2]) * t);
+    PALETTE_COVER[i] = little ? (255 << 24) | (cb << 16) | (cg << 8) | cr : (cr << 24) | (cg << 16) | (cb << 8) | 255;
   }
 })();
 
@@ -1059,7 +1111,8 @@ function resize() {
 function draw() {
   const px = new Uint32Array(tileImg.data.buffer);
   const food = sim.food;
-  for (let i = 0; i < food.length; i++) px[i] = PALETTE[(food[i] * 255) | 0];
+  const cover = sim.cover;
+  for (let i = 0; i < food.length; i++) px[i] = (cover[i] ? PALETTE_COVER : PALETTE)[(food[i] * 255) | 0];
   tileCtx.putImageData(tileImg, 0, 0);
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(tileCanvas, 0, 0, canvas.width, canvas.height);
@@ -1102,17 +1155,17 @@ let runTarget = null;       // tick to stop at for "Run for…"
 const PRESETS = {
   "Calm Meadow": {
     form: { world: "200x140", startPop: 120, mutationRate: 0.15, seasons: true, speciesThreshold: 0.25,
-      preyRatio: 0.8, escapeOn: false, escapeStrength: 0.75, meatEfficiency: 0.8, bigJumpRate: 0.01, mutationSize: 0.08 },
+      preyRatio: 0.8, escapeOn: false, escapeStrength: 0.75, meatEfficiency: 0.8, refugeCover: 0, bigJumpRate: 0.01, mutationSize: 0.08 },
     extra: { regrowRate: 0.004, fertileShift: 0.25, seasonAmp: 0.4, starter: {} },
   },
   "Harsh Desert": {
     form: { world: "200x140", startPop: 120, mutationRate: 0.15, seasons: true, speciesThreshold: 0.25,
-      preyRatio: 0.8, escapeOn: false, escapeStrength: 0.75, meatEfficiency: 0.8, bigJumpRate: 0.01, mutationSize: 0.08 },
+      preyRatio: 0.8, escapeOn: false, escapeStrength: 0.75, meatEfficiency: 0.8, refugeCover: 0, bigJumpRate: 0.01, mutationSize: 0.08 },
     extra: { regrowRate: 0.003, fertileShift: 0.42, seasonAmp: 0.6, starter: {} },
   },
   "Predator Island": {
     form: { world: "120x84", startPop: 120, mutationRate: 0.25, seasons: true, speciesThreshold: 0.25,
-      preyRatio: 0.8, escapeOn: false, escapeStrength: 0.75, meatEfficiency: 0.8, bigJumpRate: 0.1, mutationSize: 0.15 },
+      preyRatio: 0.8, escapeOn: false, escapeStrength: 0.75, meatEfficiency: 0.8, refugeCover: 0, bigJumpRate: 0.1, mutationSize: 0.15 },
     extra: { regrowRate: 0.006, fertileShift: 0.1, seasonAmp: 0.3, starter: {} },
   },
 };
@@ -1132,6 +1185,7 @@ function applyPresetToForm(name) {
   $("setEscape").checked = p.form.escapeOn;
   $("setEscStr").value = p.form.escapeStrength;
   $("setMeat").value = p.form.meatEfficiency;
+  $("setCover").value = p.form.refugeCover;
   $("setJump").value = p.form.bigJumpRate;
   $("setMutSize").value = p.form.mutationSize;
   $("presetLbl").textContent = name;
@@ -1154,10 +1208,65 @@ function readSettings() {
     escapeOn: $("setEscape").checked,
     escapeStrength: num("setEscStr", 0.75, 0.3, 1),
     meatEfficiency: num("setMeat", 0.8, 0.1, 1),
+    refugeCover: num("setCover", 0, 0, 0.3),
     bigJumpRate: num("setJump", 0.01, 0, 1),
     mutationSize: num("setMutSize", 0.08, 0, 1),
     preset: $("presetLbl").textContent,
   });
+}
+
+/* ---------- Remembered settings (localStorage) ---------- */
+// Per-browser convenience only: if storage is blocked the app still works with the defaults.
+const STORE_KEY = "tiny-ecosystem-settings-v1";
+const SETTINGS_IDS = ["setSeed", "setWorld", "setPop", "setMut", "setSeasons", "setThresh", "setPrey", "setJump", "setMutSize", "setEscape", "setEscStr", "setMeat", "setCover"];
+const SAVED_EXTRA_IDS = ["expSetting", "expValues", "expSeeds", "expTicks", "inRunFor", "chkPauseEv"];
+function saveSettings() {
+  const fields = {};
+  for (const id of [...SETTINGS_IDS, ...SAVED_EXTRA_IDS]) {
+    const el = $(id);
+    fields[id] = el.type === "checkbox" ? el.checked : el.value;
+  }
+  try { localStorage.setItem(STORE_KEY, JSON.stringify({ presetName, presetLabel: $("presetLbl").textContent, fields })); } catch (e) { /* ignore */ }
+}
+function loadSettings() {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(STORE_KEY) || "null"); } catch (e) { saved = null; }
+  if (!saved || !saved.fields) return false;
+  if (PRESETS[saved.presetName]) { presetName = saved.presetName; presetExtra = PRESETS[presetName].extra; }
+  for (const [id, v] of Object.entries(saved.fields)) {
+    const el = $(id);
+    if (!el) continue;
+    if (el.type === "checkbox") el.checked = !!v; else el.value = v;
+  }
+  if (saved.presetLabel) $("presetLbl").textContent = saved.presetLabel;
+  // The value boxes may need the on/off or number hint for the saved setting.
+  $("expValues").placeholder = EXP_SETTINGS[$("expSetting").value] && EXP_SETTINGS[$("expSetting").value].bool ? "on, off" : "0.4, 0.5, 0.6";
+  return true;
+}
+
+// Every setting the experiment will use, listed above the Start button. The varied one is highlighted.
+function renderExpSettings() {
+  const st = readSettings(), vary = $("expSetting").value;
+  const onoff = (b) => (b ? "on" : "off");
+  const rows = [
+    ["preset", "Preset", st.preset],
+    ["world", "World", st.world.join(" × ")],
+    ["startPop", "Starting creatures", st.startPop],
+    ["mutationRate", "Mutation rate", st.mutationRate],
+    ["mutationSize", "Mutation size", st.mutationSize],
+    ["bigJumpRate", "Big-jump chance", st.bigJumpRate],
+    ["seasons", "Seasons", onoff(st.seasons)],
+    ["speciesThreshold", "Species threshold", st.speciesThreshold],
+    ["preyRatio", "Prey size rule", st.preyRatio],
+    ["escapeOn", "Escape chance", onoff(st.escapeOn)],
+    ["escapeStrength", "Escape strength", st.escapeStrength],
+    ["meatEfficiency", "Meat efficiency", st.meatEfficiency],
+    ["refugeCover", "Refuge cover", st.refugeCover],
+  ];
+  $("expSettings").innerHTML = `<span class="hd">Settings for every run (change them in Settings):</span>` +
+    rows.map(([k, label, v]) => k === vary
+      ? `<span class="vary">${label}</span><span class="v vary">varied ↓</span>`
+      : `<span>${label}</span><span class="v">${v}</span>`).join("");
 }
 
 /* ---------- Speed ---------- */
@@ -1491,6 +1600,7 @@ const EXP_SETTINGS = {
   speciesThreshold: { label: "Species threshold", min: 0.05, max: 2 },
   startPop: { label: "Starting creatures", min: 1, max: 2000, int: true },
   seasons: { label: "Seasons (on/off)", bool: true },
+  refugeCover: { label: "Refuge cover", min: 0, max: 0.3 },
   escapeOn: { label: "Escape chance (on/off)", bool: true },
 };
 const EXP_HUNT_MIN = 5;        // "hunting" = peakHunters at least this many
@@ -1568,7 +1678,7 @@ function buildExperimentReport(e, notes) {
   const settings = {
     world: shared.world, startPop: shared.startPop, mutationRate: shared.mutationRate, mutationSize: shared.mutationSize,
     bigJumpRate: shared.bigJumpRate, preyRatio: shared.preyRatio, escapeOn: shared.escapeOn,
-    escapeStrength: shared.escapeStrength, meatEfficiency: shared.meatEfficiency, seasons: shared.seasons,
+    escapeStrength: shared.escapeStrength, meatEfficiency: shared.meatEfficiency, refugeCover: shared.refugeCover, seasons: shared.seasons,
     speciesThreshold: shared.speciesThreshold, preset: shared.preset,
   };
   delete settings[e.setting];
@@ -1838,6 +1948,7 @@ $("btnShowReport").onclick = showReportText;
 $("expSetting").innerHTML = Object.entries(EXP_SETTINGS).map(([k, d]) => `<option value="${k}">${d.label}</option>`).join("");
 // Switching between a number setting and an on/off one swaps in sensible example values.
 $("expSetting").addEventListener("change", () => {
+  setTimeout(renderExpSettings);
   const isBool = EXP_SETTINGS[$("expSetting").value].bool;
   const looksBool = parseOnOff($("expValues").value).length > 0 && !/\d/.test($("expValues").value);
   if (isBool && !looksBool) $("expValues").value = "on, off";
@@ -1859,10 +1970,18 @@ $("btnApply").onclick = () => { setRunning(false); newWorld(); };
 for (const b of document.querySelectorAll("[data-preset]")) {
   b.onclick = () => { applyPresetToForm(b.dataset.preset); markSettingsDirty(); };
 }
-for (const id of ["setWorld", "setPop", "setMut", "setSeasons", "setThresh", "setPrey", "setJump", "setMutSize", "setEscape", "setEscStr", "setMeat"]) {
+for (const id of ["setWorld", "setPop", "setMut", "setSeasons", "setThresh", "setPrey", "setJump", "setMutSize", "setEscape", "setEscStr", "setMeat", "setCover"]) {
   $(id).addEventListener("input", () => { $("presetLbl").textContent = presetName + " (edited)"; markSettingsDirty(); });
 }
 $("setSeed").addEventListener("input", markSettingsDirty);
+// Keep the saved settings and the experiment's settings list up to date with every change.
+for (const id of [...SETTINGS_IDS, ...SAVED_EXTRA_IDS]) {
+  $(id).addEventListener("input", () => { saveSettings(); renderExpSettings(); });
+  $(id).addEventListener("change", () => { saveSettings(); renderExpSettings(); });
+}
+for (const b of document.querySelectorAll("[data-preset]")) b.addEventListener("click", () => { saveSettings(); renderExpSettings(); });
+loadSettings();
+renderExpSettings();
 window.addEventListener("resize", resize);
 
 $("speedLbl").textContent = ticksPerFrame() + "×";
