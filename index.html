@@ -313,7 +313,7 @@
 
 <script>
 "use strict";
-const APP_VERSION = "0.10.0";
+const APP_VERSION = "0.10.1";
 
 /* ================= Seeded random (mulberry32) ================= */
 // All randomness in the sim must come from here. Never Math.random().
@@ -575,6 +575,8 @@ function compactJSON(v, indent = "") {
   const inner = indent + "  ";
   if (Array.isArray(v)) {
     if (v.every(flat)) return JSON.stringify(v);
+    // A row of plain values that also holds a short list (e.g. stretchEnds) stays on one line too.
+    if (v.some(flat) && v.every((x) => flat(x) || (Array.isArray(x) && x.every(flat)))) return JSON.stringify(v);
     return "[\n" + v.map((x) => inner + compactJSON(x, inner)).join(",\n") + "\n" + indent + "]";
   }
   const keys = Object.keys(v);
@@ -1488,10 +1490,23 @@ const EXP_SETTINGS = {
   bigJumpRate: { label: "Big-jump chance", min: 0, max: 1 },
   speciesThreshold: { label: "Species threshold", min: 0.05, max: 2 },
   startPop: { label: "Starting creatures", min: 1, max: 2000, int: true },
+  seasons: { label: "Seasons (on/off)", bool: true },
+  escapeOn: { label: "Escape chance (on/off)", bool: true },
 };
 const EXP_HUNT_MIN = 5;        // "hunting" = peakHunters at least this many
 const EXP_MAX_RUNS = 200;
 let exp = null;                // the experiment in progress (or just finished)
+
+// "on, off" / "true, false" / "yes, no" / "1, 0" -> [true, false]
+function parseOnOff(text) {
+  const out = [];
+  for (const t of text.toLowerCase().split(/[\s,;]+/).filter(Boolean)) {
+    if (["on", "true", "yes", "1"].includes(t)) out.push(true);
+    else if (["off", "false", "no", "0"].includes(t)) out.push(false);
+  }
+  return out;
+}
+const showValue = (v) => (v === true ? "on" : v === false ? "off" : v);
 
 function parseNumbers(text) {
   return text.split(/[\s,;]+/).filter(Boolean).map(Number).filter((v) => isFinite(v));
@@ -1507,21 +1522,35 @@ function parseSeeds(text) {
   return [...new Set(out)];
 }
 
+// Year phase of a tick, 0–1: 0 = mid-summer (plants grow fastest), 0.5 = mid-winter (slowest).
+function yearPhase(sim, tick) {
+  const y = sim.settings.yearLength;
+  return r2((((tick / y - 0.25) % 1) + 1) % 1);
+}
+
 function expRunMetrics(s) {
   const tl = s.timeline, PH = TIMELINE_COLS.indexOf("peakHunters");
   let firstHunterTick = null, huntingTicks = 0, stretch = 0, longest = 0, maxHunters = 0;
+  let huntStretches = 0;
+  const stretchEnds = [];
   for (let i = 1; i < tl.length; i++) {
     const ph = tl[i][PH], len = tl[i][0] - tl[i - 1][0]; // each row covers the ticks since the row before
     if (ph > maxHunters) maxHunters = ph;
     if (ph >= EXP_HUNT_MIN) {
       if (firstHunterTick === null) firstHunterTick = tl[i - 1][0];
+      if (stretch === 0) huntStretches++;
       huntingTicks += len; stretch += len; if (stretch > longest) longest = stretch;
-    } else stretch = 0;
+    } else {
+      // A stretch ends at the start of the first quiet interval after it.
+      if (stretch > 0 && s.settings.seasons) stretchEnds.push(yearPhase(s, tl[i - 1][0]));
+      stretch = 0;
+    }
   }
   if (tl.length && tl[0][PH] > maxHunters) maxHunters = tl[0][PH];
   const n = s.creatures.length;
   return {
-    firstHunterTick, huntingTicks, longestHuntStretch: longest, maxHunters,
+    firstHunterTick, huntingTicks, longestHuntStretch: longest, huntStretches,
+    stretchEnds: s.settings.seasons ? stretchEnds : null, maxHunters,
     huntersAtEnd: s.hunterCount,
     extinctions: topSpecies(s).filter((x) => x.extinctTick !== null).length,
     finalPop: n,
@@ -1531,7 +1560,7 @@ function expRunMetrics(s) {
 }
 
 const EXP_COLS = ["seed", "value", "firstHunterTick", "huntingTicks", "longestHuntStretch", "maxHunters",
-  "huntersAtEnd", "extinctions", "finalPop", "finalAvgSize", "diedOutTick"];
+  "huntersAtEnd", "extinctions", "finalPop", "finalAvgSize", "diedOutTick", "huntStretches", "stretchEnds"];
 
 function buildExperimentReport(e, notes) {
   const shared = Object.assign({}, e.base);
@@ -1561,6 +1590,10 @@ function buildExperimentReport(e, notes) {
       maxHunters: "most hunters alive at once",
       extinctions: "top-20 species (by peak population) that died out",
       diedOutTick: "tick when every creature died (null if life survived)",
+      huntStretches: "how many separate hunting stretches",
+      stretchEnds: "year phase (0-1) where each hunting stretch ended: 0 = mid-summer (fastest plant growth), " +
+        "0.25 = autumn, 0.5 = mid-winter (slowest), 0.75 = spring. A stretch still going at the end isn't listed. " +
+        "null when seasons are off",
     },
     runs: { cols: EXP_COLS, rows: e.rows.map((r) => EXP_COLS.map((c) => r[c])) },
     stewNotes: notes || "",
@@ -1569,7 +1602,8 @@ function buildExperimentReport(e, notes) {
 
 function startExperiment() {
   const setting = $("expSetting").value, def = EXP_SETTINGS[setting];
-  let values = parseNumbers($("expValues").value).map((v) => Math.min(def.max, Math.max(def.min, def.int ? Math.round(v) : v)));
+  let values = def.bool ? parseOnOff($("expValues").value)
+    : parseNumbers($("expValues").value).map((v) => Math.min(def.max, Math.max(def.min, def.int ? Math.round(v) : v)));
   values = [...new Set(values)];
   const seeds = parseSeeds($("expSeeds").value);
   const ticks = Math.max(100, Math.floor(parseFloat($("expTicks").value) || 50000));
@@ -1634,7 +1668,7 @@ function updateExpProgress() {
   const job = exp.jobs[Math.min(exp.index, exp.jobs.length - 1)];
   const left = done > 0 ? Math.round((exp.wallMs / done) * (total - done) / 1000) : null;
   $("expProgressTxt").textContent = `Run ${Math.min(exp.index + 1, exp.jobs.length)} of ${exp.jobs.length} · ` +
-    `${EXP_SETTINGS[exp.setting].label} ${job.value}, seed ${job.seed}` + (left !== null ? ` · about ${fmtTime(left)} left` : "");
+    `${EXP_SETTINGS[exp.setting].label} ${showValue(job.value)}, seed ${job.seed}` + (left !== null ? ` · about ${fmtTime(left)} left` : "");
 }
 
 function fmtTime(sec) {
@@ -1802,6 +1836,14 @@ $("btnCopy").onclick = copyReport;
 $("btnDownload").onclick = downloadReport;
 $("btnShowReport").onclick = showReportText;
 $("expSetting").innerHTML = Object.entries(EXP_SETTINGS).map(([k, d]) => `<option value="${k}">${d.label}</option>`).join("");
+// Switching between a number setting and an on/off one swaps in sensible example values.
+$("expSetting").addEventListener("change", () => {
+  const isBool = EXP_SETTINGS[$("expSetting").value].bool;
+  const looksBool = parseOnOff($("expValues").value).length > 0 && !/\d/.test($("expValues").value);
+  if (isBool && !looksBool) $("expValues").value = "on, off";
+  if (!isBool && looksBool) $("expValues").value = "0.4, 0.5, 0.6";
+  $("expValues").placeholder = isBool ? "on, off" : "0.4, 0.5, 0.6";
+});
 $("btnExpStart").onclick = startExperiment;
 $("btnExpStop").onclick = () => stopExperiment(false);
 $("btnExpCopy").onclick = () => { updateExpSize(); copyText(exp.report, "expCopyMsg"); };
