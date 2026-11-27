@@ -75,6 +75,9 @@
     border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; font-variant-numeric: tabular-nums; }
   .expset .hd { grid-column: 1 / -1; color: var(--muted); margin-bottom: 2px; }
   .expset .v { text-align: right; }
+  .importres { background: var(--panel); border-radius: 6px; padding: 8px 10px; margin: 6px 0 10px; font-size: 12px; }
+  .importres ul { margin: 4px 0 6px; padding-left: 18px; color: #e0a458; }
+  .importres .bad { color: #e0a458; }
   .expset .vary { color: var(--accent); font-weight: 600; }
   #expFill { height: 100%; width: 0; background: var(--accent); }
   #expProgress { margin: 8px 0; }
@@ -245,6 +248,14 @@
 
     <details id="settings">
       <summary>Settings</summary>
+      <div class="row">
+        <button id="btnImport">⬆️ Import settings</button>
+        <button id="btnExport">⬇️ Export settings</button>
+      </div>
+      <textarea id="settingsJson" rows="4" placeholder='Paste settings JSON here, then press Import. {"format": "tiny-ecosystem-settings/1", "settings": {...}}'
+        style="font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px"></textarea>
+      <small id="settingsMsg" class="note" style="margin:0"></small>
+      <div id="importResult" class="importres" hidden></div>
       <div class="presets">
         <button data-preset="Calm Meadow">🌼 Calm Meadow</button>
         <button data-preset="Harsh Desert">🏜️ Harsh Desert</button>
@@ -323,7 +334,7 @@
 
 <script>
 "use strict";
-const APP_VERSION = "0.11.0";
+const APP_VERSION = "0.11.1";
 
 /* ================= Seeded random (mulberry32) ================= */
 // All randomness in the sim must come from here. Never Math.random().
@@ -1236,6 +1247,7 @@ function loadSettings() {
   for (const [id, v] of Object.entries(saved.fields)) {
     const el = $(id);
     if (!el) continue;
+    if (id === "setWorld" && /^\d+x\d+$/.test(v)) { const [w, h] = v.split("x").map(Number); setWorldField(w, h); continue; }
     if (el.type === "checkbox") el.checked = !!v; else el.value = v;
   }
   if (saved.presetLabel) $("presetLbl").textContent = saved.presetLabel;
@@ -1247,26 +1259,193 @@ function loadSettings() {
 // Every setting the experiment will use, listed above the Start button. The varied one is highlighted.
 function renderExpSettings() {
   const st = readSettings(), vary = $("expSetting").value;
-  const onoff = (b) => (b ? "on" : "off");
-  const rows = [
-    ["preset", "Preset", st.preset],
-    ["world", "World", st.world.join(" × ")],
-    ["startPop", "Starting creatures", st.startPop],
-    ["mutationRate", "Mutation rate", st.mutationRate],
-    ["mutationSize", "Mutation size", st.mutationSize],
-    ["bigJumpRate", "Big-jump chance", st.bigJumpRate],
-    ["seasons", "Seasons", onoff(st.seasons)],
-    ["speciesThreshold", "Species threshold", st.speciesThreshold],
-    ["preyRatio", "Prey size rule", st.preyRatio],
-    ["escapeOn", "Escape chance", onoff(st.escapeOn)],
-    ["escapeStrength", "Escape strength", st.escapeStrength],
-    ["meatEfficiency", "Meat efficiency", st.meatEfficiency],
-    ["refugeCover", "Refuge cover", st.refugeCover],
-  ];
   $("expSettings").innerHTML = `<span class="hd">Settings for every run (change them in Settings):</span>` +
-    rows.map(([k, label, v]) => k === vary
+    settingsRows(st).map(([k, label, v]) => k === vary
       ? `<span class="vary">${label}</span><span class="v vary">varied ↓</span>`
       : `<span>${label}</span><span class="v">${v}</span>`).join("");
+}
+
+/* ---------- Settings import / export ---------- */
+const SETTINGS_FORMAT = "tiny-ecosystem-settings/1";
+// Every importable setting: same key names as the Run Report "settings" block.
+const SETTING_SPEC = {
+  world:            { label: "World" },
+  startPop:         { label: "Starting creatures", id: "setPop", min: 1, max: 2000, int: true },
+  mutationRate:     { label: "Mutation rate", id: "setMut", min: 0, max: 1 },
+  mutationSize:     { label: "Mutation size", id: "setMutSize", min: 0, max: 1 },
+  bigJumpRate:      { label: "Big-jump chance", id: "setJump", min: 0, max: 1 },
+  preyRatio:        { label: "Prey size rule", id: "setPrey", min: 0.5, max: 1 },
+  escapeOn:         { label: "Escape chance", id: "setEscape", bool: true },
+  escapeStrength:   { label: "Escape strength", id: "setEscStr", min: 0.3, max: 1 },
+  meatEfficiency:   { label: "Meat efficiency", id: "setMeat", min: 0.1, max: 1 },
+  refugeCover:      { label: "Refuge cover", id: "setCover", min: 0, max: 0.3 },
+  seasons:          { label: "Seasons", id: "setSeasons", bool: true },
+  speciesThreshold: { label: "Species threshold", id: "setThresh", min: 0.05, max: 2 },
+  preset:           { label: "Preset" },
+};
+const WORLD_MIN = 40, WORLD_MAX = 400;
+
+// All settings with their current values, in a fixed order (used by the experiment list and the import summary).
+function settingsRows(st) {
+  const onoff = (b) => (b ? "on" : "off");
+  return Object.entries(SETTING_SPEC).map(([k, d]) => {
+    const v = st[k];
+    return [k, d.label, k === "world" ? v.join(" × ") : d.bool ? onoff(v) : v];
+  });
+}
+
+function setWorldField(w, h) {
+  const val = `${w}x${h}`, sel = $("setWorld");
+  if (![...sel.options].some((o) => o.value === val)) sel.add(new Option(`Custom ${w} × ${h}`, val));
+  sel.value = val;
+}
+
+function exportSettings() {
+  const st = readSettings();
+  const settings = {};
+  for (const k of Object.keys(SETTING_SPEC)) settings[k] = st[k];
+  const ev = $("expSetting").value, def = EXP_SETTINGS[ev];
+  const out = {
+    format: SETTINGS_FORMAT,
+    settings,
+    run: { seed: st.seed, ticks: Math.max(100, Math.floor(parseFloat($("inRunFor").value) || 50000)) },
+    experiment: {
+      vary: ev,
+      values: def.bool ? parseOnOff($("expValues").value) : parseNumbers($("expValues").value),
+      seeds: parseSeeds($("expSeeds").value),
+      ticks: Math.max(100, Math.floor(parseFloat($("expTicks").value) || 50000)),
+    },
+  };
+  const text = compactJSON(out);
+  $("settingsJson").value = text;
+  $("importResult").hidden = true;
+  copyText(text, "settingsMsg");
+}
+
+function importSettings() {
+  const box = $("importResult");
+  let obj;
+  try { obj = JSON.parse($("settingsJson").value); }
+  catch (e) { box.hidden = false; box.innerHTML = `<b class="bad">⚠️ That isn't valid JSON:</b> ${escapeHtml(e.message)}`; return; }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+    box.hidden = false; box.innerHTML = `<b class="bad">⚠️ Expected a JSON object.</b>`; return;
+  }
+  const warn = [];
+  const num = (v) => (typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN);
+  if (obj.format !== SETTINGS_FORMAT) warn.push(`"format" should be "${SETTINGS_FORMAT}" (got ${JSON.stringify(obj.format)}). Imported anyway.`);
+  for (const k of Object.keys(obj)) if (!["format", "settings", "run", "experiment"].includes(k)) warn.push(`Unknown top-level key "${k}" was ignored.`);
+
+  // 1. Reset EVERY setting to its default (Calm Meadow, seed 42), so nothing from before sneaks in.
+  applyPresetToForm("Calm Meadow");
+  $("setSeed").value = DEFAULTS.seed;
+  let label = "Imported";
+
+  // 2. A known preset supplies its hidden world settings and its defaults; explicit keys then override.
+  const st = obj.settings && typeof obj.settings === "object" ? obj.settings : {};
+  if (obj.settings !== undefined && st !== obj.settings) warn.push(`"settings" should be an object. Ignored.`);
+  if ("preset" in st) {
+    const base = String(st.preset).replace(/\s*\((edited|imported)\)$/i, "");
+    if (PRESETS[base]) applyPresetToForm(base);
+    else warn.push(`Unknown preset "${st.preset}": used Calm Meadow's world (plant growth, deserts, seasons strength).`);
+    label = String(st.preset);
+  }
+  for (const [k, v] of Object.entries(st)) {
+    const d = SETTING_SPEC[k];
+    if (k === "preset") continue;
+    if (!d) { warn.push(`Unknown setting "${k}" was ignored.`); continue; }
+    if (k === "world") {
+      const ok = Array.isArray(v) && v.length === 2 && v.every((x) => Number.isInteger(x) && x >= WORLD_MIN && x <= WORLD_MAX);
+      if (ok) setWorldField(v[0], v[1]);
+      else warn.push(`"world" must be [width, height], whole numbers ${WORLD_MIN}–${WORLD_MAX} (got ${JSON.stringify(v)}). Kept ${$("setWorld").value.replace("x", " × ")}.`);
+      continue;
+    }
+    if (d.bool) {
+      if (typeof v === "boolean") $(d.id).checked = v;
+      else warn.push(`"${k}" must be true or false (got ${JSON.stringify(v)}). Kept ${$(d.id).checked}.`);
+      continue;
+    }
+    let x = num(v);
+    if (!isFinite(x)) { warn.push(`"${k}" must be a number (got ${JSON.stringify(v)}). Kept ${$(d.id).value}.`); continue; }
+    if (d.int && !Number.isInteger(x)) { warn.push(`"${k}" must be a whole number: rounded ${x} to ${Math.round(x)}.`); x = Math.round(x); }
+    if (x < d.min || x > d.max) {
+      const c = Math.min(d.max, Math.max(d.min, x));
+      warn.push(`"${k}" = ${x} is out of range (${d.min}–${d.max}): set to ${c}.`);
+      x = c;
+    }
+    $(d.id).value = x;
+  }
+  $("presetLbl").textContent = label;
+
+  // 3. Optional run: seed and Run for.
+  const extra = [];
+  if (obj.run !== undefined) {
+    const r = obj.run && typeof obj.run === "object" ? obj.run : {};
+    for (const k of Object.keys(r)) if (!["seed", "ticks"].includes(k)) warn.push(`Unknown key "run.${k}" was ignored.`);
+    if ("seed" in r) {
+      if (Number.isInteger(r.seed)) $("setSeed").value = r.seed; else warn.push(`"run.seed" must be a whole number (got ${JSON.stringify(r.seed)}). Kept ${$("setSeed").value}.`);
+    }
+    if ("ticks" in r) {
+      const t = num(r.ticks);
+      if (isFinite(t) && t >= 100) $("inRunFor").value = Math.floor(t); else warn.push(`"run.ticks" must be 100 or more (got ${JSON.stringify(r.ticks)}). Kept ${$("inRunFor").value}.`);
+    }
+    extra.push(["Run for", `${$("inRunFor").value} ticks`]);
+  }
+
+  // 4. Optional experiment: fill Experiment mode ready to start.
+  if (obj.experiment !== undefined) {
+    const e = obj.experiment && typeof obj.experiment === "object" ? obj.experiment : {};
+    for (const k of Object.keys(e)) if (!["vary", "values", "seeds", "ticks"].includes(k)) warn.push(`Unknown key "experiment.${k}" was ignored.`);
+    const def = EXP_SETTINGS[e.vary];
+    if (!def) warn.push(`"experiment.vary" = ${JSON.stringify(e.vary)} isn't a setting Experiment mode can vary. Experiment not filled in.`);
+    else {
+      $("expSetting").value = e.vary;
+      const vals = [];
+      for (const v of Array.isArray(e.values) ? e.values : []) {
+        if (def.bool) {
+          if (typeof v === "boolean") vals.push(v); else warn.push(`Experiment value ${JSON.stringify(v)} must be true or false. Skipped.`);
+          continue;
+        }
+        let x = num(v);
+        if (!isFinite(x)) { warn.push(`Experiment value ${JSON.stringify(v)} isn't a number. Skipped.`); continue; }
+        if (x < def.min || x > def.max) {
+          const c = Math.min(def.max, Math.max(def.min, x));
+          warn.push(`Experiment value ${x} is out of range for ${e.vary} (${def.min}–${def.max}): set to ${c}.`);
+          x = c;
+        }
+        vals.push(def.int ? Math.round(x) : x);
+      }
+      if (!Array.isArray(e.values) || !vals.length) warn.push(`"experiment.values" should be a list with at least one value.`);
+      $("expValues").value = vals.map(showValue).join(", ");
+      $("expValues").placeholder = def.bool ? "on, off" : "0.4, 0.5, 0.6";
+      const seeds = Array.isArray(e.seeds) ? e.seeds.filter((x) => Number.isInteger(x)) : parseSeeds(String(e.seeds ?? ""));
+      if (Array.isArray(e.seeds) && seeds.length !== e.seeds.length) warn.push(`Some experiment seeds weren't whole numbers and were skipped.`);
+      if (!seeds.length) warn.push(`"experiment.seeds" should list at least one whole-number seed.`);
+      $("expSeeds").value = seeds.join(", ");
+      const t = "ticks" in e ? num(e.ticks) : obj.run && "ticks" in obj.run ? num(obj.run.ticks) : NaN;
+      if (isFinite(t) && t >= 100) $("expTicks").value = Math.floor(t);
+      else if ("ticks" in e) warn.push(`"experiment.ticks" must be 100 or more. Kept ${$("expTicks").value}.`);
+      extra.push(["Experiment", `${EXP_SETTINGS[e.vary].label}: ${$("expValues").value} · seeds ${$("expSeeds").value} · ${$("expTicks").value} ticks each`]);
+      $("expBox").open = true;
+    }
+  }
+
+  markSettingsDirty();
+  saveSettings();
+  renderExpSettings();
+
+  const fin = readSettings();
+  const rows = settingsRows(fin).concat([["seed", "Seed", fin.seed]]).map(([, l, v]) => [l, v]).concat(extra);
+  box.hidden = false;
+  box.innerHTML =
+    `<b>✅ Imported.</b> Every setting was reset first, then set from the JSON. Final values:` +
+    `<div class="expset" style="margin-top:6px">${rows.map(([l, v]) => `<span>${escapeHtml(l)}</span><span class="v">${escapeHtml(String(v))}</span>`).join("")}</div>` +
+    (warn.length ? `<b class="bad">⚠️ ${warn.length} warning${warn.length > 1 ? "s" : ""}:</b><ul>${warn.map((w) => `<li>${escapeHtml(w)}</li>`).join("")}</ul>` : "") +
+    `<small class="note" style="margin:0">Press New world, Play or Run for… to start a world with these settings` +
+    (obj.experiment && EXP_SETTINGS[obj.experiment.vary] ? `, or Start experiment below.` : `.`) + `</small>`;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 /* ---------- Speed ---------- */
@@ -1967,6 +2146,8 @@ $("expNotes").addEventListener("input", () => { clearTimeout(updateExpSize.t); u
 $("notes").addEventListener("input", () => { clearTimeout(updateReportSize.t); updateReportSize.t = setTimeout(updateReportSize, 300); });
 $("reportBox").addEventListener("toggle", () => { if ($("reportBox").open) updateReportSize(); });
 $("btnApply").onclick = () => { setRunning(false); newWorld(); };
+$("btnImport").onclick = importSettings;
+$("btnExport").onclick = exportSettings;
 for (const b of document.querySelectorAll("[data-preset]")) {
   b.onclick = () => { applyPresetToForm(b.dataset.preset); markSettingsDirty(); };
 }
